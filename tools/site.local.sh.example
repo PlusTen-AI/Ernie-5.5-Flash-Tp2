@@ -1,0 +1,18 @@
+# site.local.sh — this site's addresses for the development tools (tools/dev.sh, sync.sh, preflight.sh,
+# check_public.sh). Copy to tools/site.local.sh (git ignores it) and fill it in. The serving recipe itself
+# (./start.sh) does not use this file: its settings are serve.local.toml.
+HEAD=head-node               # how this machine reaches the head by ssh
+WORKER=worker-node           # how the head reaches the worker by ssh
+HEAD_HOSTNAME=head           # `hostname` on each, checked by the preflight
+WORKER_HOSTNAME=worker
+WORKER_CX=(10.0.0.2 10.0.1.2)   # the worker's CX7 addresses (one per rail), as the head reaches them
+HEAD_CX=10.0.0.1
+WORK=/home/user/work/ernie-5.5-flash     # the project's work folder on both nodes
+MODELS=/home/user/models/ERNIE-5.5-Flash # the weights' parent folder
+CKPT=ERNIE-5.5-Flash-Preview             # the checkpoint folder under MODELS
+GUARD_SWAP=""                # optional: a model proxy whose /running must be empty before GPU work
+GUARD_ROUTER=""              # optional: a router whose /router/status must show GUARD_PAIR on hold
+GUARD_PAIR=""
+GUARD_KEY=""                 # optional: the bearer key GUARD_SWAP / GUARD_ROUTER ask for
+URL=http://head-node:8890/v1 # the head's API as this machine reaches it
+PRIVATE='10\.0\.0\.|head-node|worker-node|/home/user/'   # check_public.sh: what must never appear in tracked files

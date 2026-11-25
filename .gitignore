@@ -1,0 +1,16 @@
+# private: the working notes, the records and this site's settings stay on the machine that has them
+CLAUDE.md
+/results/
+serve.local.toml
+tools/site.local.sh
+# reference sources (vLLM-ERNIE, vLLM) read for the port, not part of the engine
+/ref/
+# work data and caches
+.work/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+/scratch/
+/build/
+.claude/
