@@ -201,7 +201,9 @@ class Scheduler:
         self.inbox = queue.Queue()
         self.waiting, self.running = [], []
         # running totals (also read by /metrics from the HTTP thread: plain int updates, no lock needed)
-        self.stats = {"requests": 0, "prompt": 0, "cached": 0, "out": 0}
+        self.stats = {"requests": 0, "prompt": 0, "cached": 0, "out": 0, "drafts": 0, "draft_tokens": 0, "accepted": 0}
+        # the engine's speculative totals when serving begins (the scheduler is made after the warm-up's rounds)
+        self._spec0 = self.peek.spec_stats(False) if self.block else None
         # decode steps by sequences: [steps, ms inside the step, ms from this step's start to the next one's (only
         # when no prefill chunk ran in between), steps counted in that wall total]
         self.rstats = {}
@@ -500,6 +502,7 @@ class Scheduler:
         x[0] += 1
         x[1] += 1e3 * (time.perf_counter() - t0)
         self._prev = (B, t0)
+        self._spec_count()
         for r, toks in zip(rs, outs):
             r.slot.hist.append(r.last)
             r.slot.hist += toks[:-1]
@@ -511,6 +514,13 @@ class Scheduler:
         self.copy.sync(s)
         self.copy.t["chunk"] += time.perf_counter() - t
         self.copy.c["chunk"] += 1
+
+    def _spec_count(self):
+        """/metrics' speculative-decoding counters (vLLM's names): the engine's running totals of sequence-rounds,
+        verified drafts (DSpark's and copy drafts) and accepted ones — a local read, nothing goes over the link."""
+        st = self.peek.spec_stats(False)
+        self.stats["drafts"], self.stats["draft_tokens"], self.stats["accepted"] = (
+            int(st[k] - self._spec0[k]) for k in ("seqs", "verified", "accepted"))
 
     def _copy_round(self, r, t0):
         """P168: r decodes alone — when its reply repeats its history (copy_draft.Copier), one round verifying the
@@ -544,6 +554,7 @@ class Scheduler:
         x[0] += 1
         x[1] += 1e3 * (time.perf_counter() - t0)
         self._prev = (1, t0)
+        self._spec_count()
         r.slot.hist.append(r.last)
         r.slot.hist += toks[:-1]
         cp.after(r, src, k, toks, go)

@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 
 ap = argparse.ArgumentParser()
-ap.add_argument("url", nargs="?", default="http://127.0.0.1:8890/v1")
+ap.add_argument("url", nargs="?", default="http://127.0.0.1:8888/v1")
 ap.add_argument("--only", default="smoke,api,tools,thinking,needle")
 ap.add_argument("--needle", default="1000000", help="prompt lengths in tokens (approximate; cut to the context)")
 ap.add_argument("--key", default=None, help="the server's API key (server.api_key); sent with every request")

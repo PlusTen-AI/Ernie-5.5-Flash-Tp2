@@ -241,7 +241,10 @@ def build(chat, sched, served, ctx, think_cfg=None, default_max=0):
                 ("counter", "vllm:prompt_tokens_total", st["prompt"]),
                 ("counter", "vllm:prompt_tokens_cached_total", st["cached"]),
                 ("counter", "vllm:generation_tokens_total", st["out"]),
-                ("counter", "vllm:request_success_total", st["requests"])]
+                ("counter", "vllm:request_success_total", st["requests"]),
+                ("counter", "vllm:spec_decode_num_drafts_total", st.get("drafts", 0)),
+                ("counter", "vllm:spec_decode_num_draft_tokens_total", st.get("draft_tokens", 0)),
+                ("counter", "vllm:spec_decode_num_accepted_tokens_total", st.get("accepted", 0))]
         txt = "".join(f"# TYPE {n.removesuffix('_total')} {t}\n{n}{lab} {v}\n" for t, n, v in rows)
         for B, v in sorted(dict(sched.rstats).items()):
             for name, x in zip(("steps", "engine_ms", "wall_ms", "wall_steps"), v):

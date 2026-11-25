@@ -26,7 +26,7 @@ import urllib.request
 import uuid
 
 ap = argparse.ArgumentParser()
-ap.add_argument("url", nargs="?", default="http://localhost:8890/v1")
+ap.add_argument("url", nargs="?", default="http://localhost:8888/v1")
 ap.add_argument("--doc", required=True, help="text file to build prompts from (e.g. the model's README + template)")
 ap.add_argument("--ctx", type=int, default=8192, help="approx. prompt tokens for the decode cases")
 ap.add_argument("--streams", default="1,2,3,4", help="decode: streams at once, one case each (comma list)")

@@ -37,7 +37,7 @@ image = "ernie55-plus"
 [server]
 served_name = "baidu/ERNIE-5.5-Flash"
 host = "0.0.0.0"
-port = 8890
+port = 8888
 slots = 4               # requests served at the same time
 # Tokens per request at most (prompt + output), up to 1,048,576 (the model's limit). With the KV pool (patches.kv_pool,
 # on by default) this costs no memory up front: the caches come from the pool as a request grows (~4.4 KiB a token on

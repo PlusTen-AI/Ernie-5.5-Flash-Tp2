@@ -19,7 +19,7 @@ weights = "/home/user/models/ERNIE-5.5-Flash/ERNIE-5.5-Flash-Preview"
 # ---- Often changed: uncomment what you need (the values shown are the defaults) ----
 
 # [server]
-# port = 8890                       # HTTP port
+# port = 8888                       # HTTP port
 # api_key = ""                      # clients send "Authorization: Bearer <key>" for /v1/* (/health, /metrics stay open)
 # served_name = "baidu/ERNIE-5.5-Flash"   # the model name in the API
 # slots = 4                         # requests served at the same time
