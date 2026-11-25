@@ -1,13 +1,40 @@
 # serve.local.toml — your pair of machines. Copy this file to serve.local.toml (git ignores it) and fill it in.
-# Only what differs from serve.toml goes here; ./start.sh check tells you what is missing.
+# Only what differs from serve.toml goes here; ./start.sh check tells you what is missing. serve.toml holds every
+# setting with its default and explanation; a value here wins over it (and E55_<SECTION>_<KEY> or --set wins over both).
 
 [cluster]
-# How the head node reaches the worker by ssh (key login, no password): "user@host" or a ~/.ssh/config name.
+# Required. How the head node reaches the worker by ssh (key login, no password): "user@host" or a ~/.ssh/config name.
 worker = "user@192.0.2.12"
 # The worker's address on the direct CX7 cable. The interface, this node's address, the RDMA device, the GID index
 # and the second rail are read from the route to this address at every start.
 worker_addr = ["10.0.0.2"]
+# TCP ports on the CX7 addresses, if these are taken (the RDMA all-reduce also uses nccl_port + 1).
+# nccl_port = 29611
+# link_port = 29650
 
 [paths]
-# The downloaded checkpoint folder, the same path on both nodes.
+# Required. The downloaded checkpoint folder, the same path on both nodes.
 weights = "/home/user/models/ERNIE-5.5-Flash/ERNIE-5.5-Flash-Preview"
+
+# ---- Often changed: uncomment what you need (the values shown are the defaults) ----
+
+# [server]
+# port = 8890                       # HTTP port
+# api_key = ""                      # clients send "Authorization: Bearer <key>" for /v1/* (/health, /metrics stay open)
+# served_name = "baidu/ERNIE-5.5-Flash"   # the model name in the API
+# slots = 4                         # requests served at the same time
+# context = 1048576                 # tokens a request at most (prompt + output)
+# max_tokens = 131072               # reply tokens of a request that sends no max_tokens (0 = all the room left)
+# memory_free_gib = 15              # memory left free on each machine after the KV pool
+# kv_pool_gib = 0                   # cap on the KV pool (0 = all the room)
+
+# [decode]
+# dspark = true                     # DSpark speculative decoding (false = plain decoding, the draft not loaded)
+# block = 7                         # draft tokens per round (the model card: up to 7 at low concurrency, 2–3 at high)
+# copy = true                       # copy drafts when a reply repeats text of its history (file rewrites, echoed code)
+
+# [thinking]
+# budget_low = 0                    # thinking-token budget per effort level (0 = none); a request's thinking_budget wins
+# budget_medium = 0
+# budget_high = 0
+# loop_guard = true                 # close a looping thinking once per reply
