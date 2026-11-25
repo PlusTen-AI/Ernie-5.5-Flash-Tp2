@@ -1,0 +1,15 @@
+ERNIE-5.5-Flash-Tp2 (the Plus engine for ERNIE 5.5 Flash)
+Copyright 2026 PlusTen-AI
+
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+This product includes files from the checkpoint baidu/ERNIE-5.5-Flash-Preview @ de3ffd3e (Apache-2.0,
+Copyright 2026 Baidu), copied unchanged:
+  server/ernie_proto/encoding_ernie.py
+  server/ernie_proto/decoding_ernie.py
+server/ernie_proto/tokens.py follows the same checkpoint's tokenization_ernie.py.
+
+The model's math (docs/model.md) and the reference forward (tools/ref/ernie_ref.py) are written from vLLM-ERNIE
+(https://github.com/baidu/vLLM-ERNIE @ 4a971d3, Apache-2.0) on vLLM 0.32.0 (Apache-2.0).
+
+The model weights are not part of this repository and keep their own license.
