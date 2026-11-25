@@ -1,7 +1,5 @@
 <h1 align="center">ERNIE-5.5-Flash on two DGX Sparks</h1>
 
-<!-- TODO(boss): banner image (docs/assets/banner.png) and byline, if any -->
-
 <p align="center">
   <img src="https://img.shields.io/badge/model-ERNIE%205.5%20Flash%20Preview-ffffff?style=flat-square&labelColor=000000">
   <img src="https://img.shields.io/badge/hardware-2x%20DGX%20Spark%20(GB10)-bbbbbb?style=flat-square&labelColor=000000">
@@ -87,8 +85,6 @@ Measured on one pair with our bench (2026-11-25): a real 131K-token agent conver
 (the engine's `high`), default sampling (T 1.0, top_p 0.95), seed 1; served defaults (4 slots, DSpark block 7, copy
 drafts on). Decode is tokens written after the first over the writing time.
 
-<!-- TODO(boss): bench card images (docs/bench/*.png), or keep the boxes -->
-
 The summary is at the top. In detail:
 
 ```
@@ -140,8 +136,6 @@ Prefill by prompt length, from one cold read of a 995K-token prompt (the server'
   written from vLLM-ERNIE's code ([tools/ref/ernie_ref.py](tools/ref/ernie_ref.py)), layer by layer, prefill and the
   cached decode path; each layer also run alone on the engine's own input (differences at rounding level, the same
   routed experts).
-  <!-- TODO(boss): this says "rounding level", not "bitwise to vLLM-ERNIE" — the reference is a PyTorch forward, and
-  end-to-end top-1 agreement on its prompts is 0.72–0.86 (0.94–1.00 where the reference is sure). Keep, reword, or add numbers? -->
 - **Every speed patch, on against off, bitwise** ([engine/tests/patch_check.py](engine/tests/patch_check.py)): a
   16K-token prefill, prefill chunks, decode steps, multi-row and mixed-slot steps, DSpark drafts.
 - **Speculative decoding is plain decoding**: greedy DSpark rounds give plain greedy's tokens (448 thinking, 320 code
@@ -222,8 +216,6 @@ If a rank stops, both go down and the start says where the logs are. Logs of ear
 └──────────────────────────────┴────────────────┴────────────────────┴─────────────────────┘
   12: computed from the start at 15 (same free memory before the pool, ~1.8 % overhead)
 ```
-
-<!-- TODO(boss): replace the 12 GiB row with the [kv pool] line of a start at 12 -->
 
 - A request is placed when the pool holds its prompt plus `min(max_tokens, output_reserve)` (32,768) beside the
   running requests' reservations; otherwise it waits. A longer reply takes more as it goes and ends with
