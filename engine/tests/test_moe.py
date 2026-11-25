@@ -8,7 +8,7 @@
 4. patches (moe.cu P035–P037, P065–P069, P086) against the base, same inputs: bitwise equal; time per call (CUDA events,
    median), decode cold (L2 flushed before every call, a different routing each call). P066 (moe_fused: routing +
    latent quantization + experts) against route + act_quant (tests/bind/moe_aq.cu, the engine's kernel) + experts, timed
-   on the reference dumps' real routing (/work/results/ref/v2) as DSpark-like blocks of 8 consecutive tokens. P086
+   on the reference dumps' real routing (/work/results/ref/v3) as DSpark-like blocks of 8 consecutive tokens. P086
    (moe_pf_dn) against the default prefill path (P037 + P065) at M = 4096 / 8192 on layer L's real routing (the
    reference's router on real hidden states, ref v3 dumps: doc_long + en_tools + ko_short = 4575 tokens, 8192 rows
    repeat doc_long), both ranks, bf16 and fp32 outputs bitwise; ms per call (median of 12, warm: the 1.7 GB expert
@@ -107,7 +107,7 @@ def real_logits(MM, i):
     if not REAL:
         from safetensors import safe_open as so
         for n in ("en_tools", "doc_long"):
-            with so(f"/work/results/ref/v2/{n}.safetensors", framework="pt", device="cpu") as f:
+            with so(f"/work/results/ref/v3/{n}.safetensors", framework="pt", device="cpu") as f:
                 REAL[n] = f.get_tensor("route")[L].long()
     starts = [("en_tools", 100), ("doc_long", 1000), ("en_tools", 500), ("doc_long", 3000)]
     rows = []

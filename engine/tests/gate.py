@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """gate.py — the correctness gate: the engine (TP=2, both ranks) against the reference forward (tools/ref/ernie_ref.py
 dumps), layer by layer. Run through tools/tp2.sh (it appends --rank and --head-ip):
-  tools/tp2.sh gate python3 /work/src/engine/tests/gate.py --ref /work/results/ref/v1 [--names a,b]
+  tools/tp2.sh gate python3 /work/src/engine/tests/gate.py --ref /work/results/ref/v3 [--names a,b]
 Per prompt:
   A. one prefill step over the whole prompt: residual after every layer, attention / FFN outputs and MoE expert sets
      at the dump's positions; logits there (top-1 agreement, KL, max |Δ|)
