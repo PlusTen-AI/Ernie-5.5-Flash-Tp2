@@ -21,21 +21,28 @@ MXFP4 kernels, DSpark speculative decoding, two-rail RDMA between the Sparks. No
 > **Installing this with an AI agent?** Point it at [AGENTS.md](AGENTS.md): every step, how to check it, and when to
 > stop and ask you. Agents: start there.
 
-| On two Sparks (131K-token agent context) | |
-| --- | ---: |
-| One agent writing | **58.6 tok/s** (code 70 · JSON 70 · counting 97) |
-| Four agents at once, total | **124 tok/s** (JSON 147 · counting 199) |
-| Reading a 128K prompt | **3,259 tok/s**, first token in 40 s |
-| An agent's next turn after a tool result | **3.3 s** to the first token |
-| Rewriting a file with one edit (copy drafts) | **307 tok/s** |
-| Context | **1,048,576 tokens** a request, **~2.9M** in the shared KV pool (12 GiB kept free) |
+```
+┌───────────────────────────────────────────────────────────────────┬──────────────────────┐
+│ ERNIE 5.5 Flash on 2x DGX Spark · 131K-token agent context        │           plus 0.5.0 │
+├───────────────────────────────────────────────────────────────────┼──────────────────────┤
+│ one agent writing                                                 │           58.6 tok/s │
+│   code · JSON · counting                                          │   70 · 70 · 97 tok/s │
+│ four agents at once, total                                        │            124 tok/s │
+│   JSON · counting                                                 │      147 · 199 tok/s │
+│ reading a 128K prompt                                             │   3,259 tok/s · 40 s │
+│ an agent's next turn after a tool result                          │ 3.3 s to first token │
+│ rewriting a file with one edit (copy drafts)                      │            307 tok/s │
+│ context a request · in the shared KV pool (12 GiB kept free)      │    1,048,576 · ~2.9M │
+└───────────────────────────────────────────────────────────────────┴──────────────────────┘
+  our bench · effort max (engine high) · default sampling (T 1.0, top_p 0.95) · seed 1
+```
 
 ```sh
 git clone https://github.com/PlusTen-AI/Ernie-5.5-Flash-Tp2.git && cd Ernie-5.5-Flash-Tp2
-cp serve.local.toml.example serve.local.toml && $EDITOR serve.local.toml   # the second Spark, its cable address, the checkpoint
-./start.sh check      # everything start needs, one line each; nothing is changed
-./start.sh            # finds the cable, builds the image once and sends it to the second Spark, starts both, waits for /health
-./stop.sh             # drains, stops both, and reports that nothing is left behind
+cp serve.local.toml.example serve.local.toml   # set the worker, its cable address, weights
+./start.sh check   # everything start needs, one line each; nothing is changed
+./start.sh         # finds the cable, builds the image once, starts both, waits for /health
+./stop.sh          # drains, stops both, reports that nothing is left behind
 ```
 
 Nothing is installed on the hosts: everything runs in one Docker image, both Sparks the very same one.
@@ -80,37 +87,46 @@ Measured on one pair with our bench (2026-11-25): a real 131K-token agent conver
 (the engine's `high`), default sampling (T 1.0, top_p 0.95), seed 1; served defaults (4 slots, DSpark block 7, copy
 drafts on). Decode is tokens written after the first over the writing time.
 
-<!-- TODO(boss): bench card images (docs/bench/*.png) like the Plus README, or keep the tables -->
+<!-- TODO(boss): bench card images (docs/bench/*.png), or keep the boxes -->
 
-| Summary | |
-| --- | ---: |
-| Reading a 128K prompt | **3,259 tok/s** (first token 40.3 s) |
-| Next turn after a tool result (+7,820 tokens, 94% reused) | **3.27 s** to the first token |
-| One agent writing | **58.6 tok/s** (fastest 10 s: 65.7) |
-| Four agents at once, total | **124.2 tok/s** |
+The summary is at the top. In detail:
 
-| Decode at 131K context | 1 at once | 2 | 3 | 4 at once |
-| --- | ---: | ---: | ---: | ---: |
-| Agent replies, total tok/s | 58.6 | 87.7 | 107.0 | 124.2 |
+```
+┌──────────────────────────────────────────────────────────┬───────┬───────┬───────┬───────┐
+│ 1 to 4 at once                                           │     1 │     2 │     3 │     4 │
+├──────────────────────────────────────────────────────────┼───────┼───────┼───────┼───────┤
+│ decode, total tok/s                                      │  58.6 │  87.7 │ 107.0 │ 124.2 │
+│ prefill, total tok/s (cold 128K prompts)                 │ 3,259 │ 3,277 │ 3,272 │ 3,281 │
+│ slowest first token                                      │  40 s │  80 s │ 120 s │ 160 s │
+└──────────────────────────────────────────────────────────┴───────┴───────┴───────┴───────┘
+```
 
-Decode depends on how predictable the text is (accepted drafts):
+Decode depends on how predictable the text is (accepted = drafts the model kept):
 
-| Item | 1 at once | accepted | 4 at once, total | accepted |
-| --- | ---: | ---: | ---: | ---: |
-| Coding | 70.3 | 67% | 121.5 | 73% |
-| JSON | 70.0 | 66% | 147.0 | 80% |
-| Reasoning | 66.4 | 66% | 128.0 | 74% |
-| Summary | 52.1 | 56% | 107.3 | 68% |
-| Prose | 44.1 | 49% | 92.7 | 59% |
-| Prose (Korean) | 46.0 | 50% | 96.5 | 60% |
-| Counting | 97.0 | 89% | 199.4 | 95% |
+```
+┌────────────────────────────────────────────┬───────────┬──────────┬───────────┬──────────┐
+│ decode by item, tok/s                      │ 1 at once │ accepted │ 4 at once │ accepted │
+├────────────────────────────────────────────┼───────────┼──────────┼───────────┼──────────┤
+│ coding                                     │      70.3 │      67% │     121.5 │      73% │
+│ JSON                                       │      70.0 │      66% │     147.0 │      80% │
+│ reasoning                                  │      66.4 │      66% │     128.0 │      74% │
+│ summary                                    │      52.1 │      56% │     107.3 │      68% │
+│ prose                                      │      44.1 │      49% │      92.7 │      59% │
+│ prose (Korean)                             │      46.0 │      50% │      96.5 │      60% │
+│ counting                                   │      97.0 │      89% │     199.4 │      95% │
+└────────────────────────────────────────────┴───────────┴──────────┴───────────┴──────────┘
+```
 
 Prefill by prompt length, from one cold read of a 995K-token prompt (the server's `prefill_marks`, engine 0.4.0):
 
-| Prompt | 8K | 32K | 128K | 256K | 512K | 995K |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| First token | 2.1 s | 8.8 s | 40.2 s | 92.6 s | 235 s | 625.8 s |
-| tok/s | 3,842 | 3,730 | 3,264 | 2,830 | 2,231 | 1,591 |
+```
+┌──────────────────────────────────────┬───────┬───────┬────────┬────────┬───────┬─────────┐
+│ prefill by prompt length             │    8K │   32K │   128K │   256K │  512K │    995K │
+├──────────────────────────────────────┼───────┼───────┼────────┼────────┼───────┼─────────┤
+│ first token                          │ 2.1 s │ 8.8 s │ 40.2 s │ 92.6 s │ 235 s │ 625.8 s │
+│ tok/s                                │ 3,842 │ 3,730 │  3,264 │  2,830 │ 2,231 │   1,591 │
+└──────────────────────────────────────┴───────┴───────┴────────┴────────┴───────┴─────────┘
+```
 
 - Prompts are read one at a time in 8,192-row chunks (2.1 s each at the start of a prompt, 5.2 s at 512K); requests
   that are decoding run a round between chunks. Four cold 128K prompts at once read at 3,281 tok/s in total.
@@ -156,22 +172,23 @@ An AI agent doing this for you: [AGENTS.md](AGENTS.md).
 git clone https://github.com/PlusTen-AI/Ernie-5.5-Flash-Tp2.git && cd Ernie-5.5-Flash-Tp2
 cp serve.local.toml.example serve.local.toml
 $EDITOR serve.local.toml     # the worker's ssh name, its CX7 address, the checkpoint's path
-./start.sh download          # only without the checkpoint (~154 GiB; copied to the worker too)
+./start.sh download          # only without the checkpoint (~154 GiB, copied to the worker)
 ./start.sh check
-./start.sh                   # the first start builds the image (10–30 min) and the engine (~2.5 min); later ~1 min
-curl http://localhost:8888/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model": "baidu/ERNIE-5.5-Flash", "messages": [{"role": "user", "content": "Hello!"}]}'
+./start.sh                   # first start: image 10–30 min + engine ~2.5 min; later ~1 min
+curl http://localhost:8888/v1/chat/completions -H 'Content-Type: application/json' -d \
+  '{"model": "baidu/ERNIE-5.5-Flash", "messages": [{"role": "user", "content": "Hello!"}]}'
 ./stop.sh
 ```
 
-| Command | |
-| --- | --- |
-| `./start.sh` / `./start.sh restart` | start (or stop, then start) both ranks; `--set section.key=value` for one run |
-| `./stop.sh` | running requests get `drain_seconds` (30) to finish, then both ranks stop |
-| `./start.sh status` | both containers and `/health` |
-| `./start.sh logs [N]` | rank 0's last N lines |
-| `./start.sh check` | settings, ssh, the link, the checkpoint on both, the image, memory and ports |
-| `./start.sh download` | the checkpoint from Hugging Face at the pinned revision (`HF_TOKEN` used if set) |
+```
+./start.sh [--set section.key=value]   start both ranks (--set: a setting for this run only)
+./start.sh restart                     stop, then start
+./stop.sh                              requests get drain_seconds (30), then both stop
+./start.sh status                      both containers and /health
+./start.sh logs [N]                    rank 0's last N lines
+./start.sh check                       settings, ssh, link, checkpoint, image, memory, ports
+./start.sh download                    the checkpoint from Hugging Face (HF_TOKEN if set)
+```
 
 ## How it starts
 
@@ -194,16 +211,20 @@ If a rank stops, both go down and the start says where the logs are. Logs of ear
 - Each rank holds 73.7 GiB of weights. The caches are ~4.5 KB a token on each node (HCA compressed entries and DSA
   latent / indexer rows), so a 1M-token request is ~4.5 GB a node.
 - After the warm-up the pool takes what is left on the node with less of it, less `memory_free_gib`, at most
-  `kv_pool_gib`. On our pair:
+  `kv_pool_gib`. One request is at most 1,048,576 tokens (the model's limit); the pool is shared by the 4 slots.
 
-  | `memory_free_gib` | KV pool a node | Tokens in the pool | 1M-token requests at once |
-  | ---: | ---: | ---: | ---: |
-  | **12** | **~12.1 GiB** (~6,216 chunks) | **~2.89M** | 2, plus ~0.79M |
-  | 15 | 9.2 GiB (4,708 chunks) | 2.19M | 2, plus ~0.09M |
+```
+┌──────────────────────────────┬────────────────┬────────────────────┬─────────────────────┐
+│ memory_free_gib              │ KV pool a node │ tokens in the pool │ 1M requests at once │
+├──────────────────────────────┼────────────────┼────────────────────┼─────────────────────┤
+│ 12 (computed)                │      ~12.1 GiB │             ~2.89M │      2, plus ~0.79M │
+│ 15 (measured)                │        9.2 GiB │              2.19M │      2, plus ~0.09M │
+└──────────────────────────────┴────────────────┴────────────────────┴─────────────────────┘
+  12: computed from the start at 15 (same free memory before the pool, ~1.8 % overhead)
+```
 
-  <!-- TODO(boss): the 12 GiB row is computed from the measured 15 GiB start (same free memory before the pool, the
-  same ~1.8 % chunk overhead); replace it with the [kv pool] line of a start at 12 -->
-  One request is at most 1,048,576 tokens (the model's limit); the pool is shared by the 4 slots.
+<!-- TODO(boss): replace the 12 GiB row with the [kv pool] line of a start at 12 -->
+
 - A request is placed when the pool holds its prompt plus `min(max_tokens, output_reserve)` (32,768) beside the
   running requests' reservations; otherwise it waits. A longer reply takes more as it goes and ends with
   `finish_reason: length` only when the pool is full. A prompt no pool could hold gets a 400.
@@ -246,12 +267,16 @@ are shaped like vLLM's. A request that sends no sampling fields gets the checkpo
 **Thinking.** On by default; the reasoning comes back as `reasoning_content` (and `reasoning`). Turn it off with
 `chat_template_kwargs: {"enable_thinking": false}`. ERNIE's template has three effort levels; other names map to them:
 
-| `reasoning_effort` | ERNIE |
-| --- | --- |
-| `none` | thinking off |
-| `minimal`, `low` | low |
-| `medium` | medium |
-| `high`, `xhigh`, `max`, not sent | high |
+```
+┌───────────────────────────────────────────────────────────────────────────┬──────────────┐
+│ reasoning_effort                                                          │        ERNIE │
+├───────────────────────────────────────────────────────────────────────────┼──────────────┤
+│ none                                                                      │ thinking off │
+│ minimal, low                                                              │          low │
+│ medium                                                                    │       medium │
+│ high, xhigh, max, or not sent                                             │         high │
+└───────────────────────────────────────────────────────────────────────────┴──────────────┘
+```
 
 **Tool calls** are parsed by Baidu's `decoding_ernie.py` as shipped and returned as OpenAI `tool_calls`
 (`tool_choice` auto / required / named / none, streamed deltas, `parallel_tool_calls`). Text a client writes that
@@ -262,11 +287,11 @@ looks like a special token is encoded as text, so only the template's own marker
 [engine/src/model/patches.def](engine/src/model/patches.def) lists 96 numbered patches, one line each, 89 on by
 default. The base implementation always stays; a patch adds a variant and has an off switch. A patch that changes
 arithmetic must be bitwise equal to the base (patch_check); the DSpark ones change only the drafts or how many are
-verified, never the output distribution. Numbers follow Plus where a patch came from there.
+verified, never the output distribution.
 
 | Patches | What they do |
 | --- | --- |
-| 1–19 | From Plus: two-rail RDMA all-reduce, prefill GEMM tiles, a lossless 12-bit copy of bf16 weights, block verification, sampling from each vocabulary half's top-64 |
+| 1–19 | Two-rail RDMA all-reduce, prefill GEMM tiles, a lossless 12-bit copy of bf16 weights, block verification, sampling from each vocabulary half's top-64 |
 | 30–37 | FP8 block GEMMs for decode and prefill, fused activation quantization, PDL launches; MoE W4A8 decode and prefill kernels, fast routing |
 | 40–51 | HCA attention, compressor and VHA; DSA attention, indexer select and W_UK / W_UV; mHC kernels |
 | 60–79 | Fusions around the GEMMs, the decode MoE as one persistent launch, prefill in lanes with async all-reduces, RDMA all-gathers, split weights for small steps |
@@ -308,8 +333,6 @@ ERNIE 5.5 Flash and its checkpoint are Baidu's. The chat template and output par
 `encoding_ernie.py`, `decoding_ernie.py`) are copied unchanged from the checkpoint (Apache-2.0, Copyright 2026 Baidu);
 `tokens.py` follows its `tokenization_ernie.py`. The model's math is written from
 [vLLM-ERNIE](https://github.com/baidu/vLLM-ERNIE) (`4a971d3`, Apache-2.0) on vLLM 0.32.0, used as the reference only.
-The server layer, the RDMA all-reduce and several kernels come from Plus, our
-[Qwen3.8-Flash-Next TP2 engine](https://github.com/PlusTen-AI/Qwen3.8-Flash-Next-TP2).
 
 ## License
 
