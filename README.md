@@ -21,7 +21,7 @@ MXFP4 kernels, DSpark speculative decoding, two-rail RDMA between the Sparks. No
 
 ```
 ┌───────────────────────────────────────────────────────────────────┬──────────────────────┐
-│ ERNIE 5.5 Flash on 2x DGX Spark · 131K-token agent context        │           plus 0.5.0 │
+│ ERNIE 5.5 Flash on 2x DGX Spark · 131K-token agent context        │           plus 0.6.0 │
 ├───────────────────────────────────────────────────────────────────┼──────────────────────┤
 │ one agent writing                                                 │           58.6 tok/s │
 │   code · JSON · counting                                          │   70 · 70 · 97 tok/s │
@@ -45,7 +45,7 @@ cp serve.local.toml.example serve.local.toml   # set the worker, its cable addre
 
 Nothing is installed on the hosts: everything runs in one Docker image, both Sparks the very same one.
 
-**Engine: Plus 0.5.0** (`/version`), a C++/CUDA inference engine and OpenAI-compatible server for this one model. It
+**Engine: Plus 0.6.0** (`/version`), a C++/CUDA inference engine and OpenAI-compatible server for this one model. It
 serves the [`ERNIE-5.5-Flash-Preview`](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview) checkpoint (`de3ffd3e`)
 at tensor parallel 2, one rank on each Spark (GB10, 128 GB unified memory), over their ConnectX-7 cable. The weights
 run as Baidu ships them: block FP8 linears and MXFP4 routed experts (W4A8), FP8 KV caches, an FP4 indexer. Rank 0
@@ -54,7 +54,8 @@ serves the API; rank 1 follows its steps.
 - **Lossless.** The checkpoint's own precision everywhere, no extra quantization. Speculative decoding keeps the
   output distribution: greedy requests get plain decoding's tokens, sampled ones the same distribution.
 - **Deterministic and batch-invariant.** A row's result is the same chain of operations whatever else is in the step,
-  so decoding, chunked prefill, cache reuse and speculative rounds give the same bits for the same token.
+  so decoding and speculative rounds give the same bits for the same token, and so do chunked prefill and cache reuse.
+  Prefill kernels may sum in their own order and are checked against the reference instead (the prefill rule).
 - **1M context.** Up to 1,048,576 tokens a request; the caches of all requests come from one KV pool (about 2.9M
   tokens on the pair), and requests are admitted by it.
 - **Agent-ready.** ERNIE's own chat template and output parser (Baidu's files, unchanged), thinking with three effort
@@ -81,9 +82,9 @@ Left out: FlashIndexer head routing (approximate; off in Baidu's default serving
 
 ## Performance
 
-Measured on one pair with our bench (2026-11-25): a real 131K-token agent conversation as the context, effort max
-(the engine's `high`), default sampling (T 1.0, top_p 0.95), seed 1; served defaults (4 slots, DSpark block 7, copy
-drafts on). Decode is tokens written after the first over the writing time.
+Measured on one pair with our bench (2026-11-25, engine 0.5.0): a real 131K-token agent conversation as the context,
+effort max (the engine's `high`), default sampling (T 1.0, top_p 0.95), seed 1; served defaults (4 slots, DSpark block
+7, copy drafts on). Decode is tokens written after the first over the writing time.
 
 The summary is at the top. In detail:
 
@@ -95,6 +96,19 @@ The summary is at the top. In detail:
 │ prefill, total tok/s (cold 128K prompts)                 │ 3,259 │ 3,277 │ 3,272 │ 3,281 │
 │ slowest first token                                      │  40 s │  80 s │ 120 s │ 160 s │
 └──────────────────────────────────────────────────────────┴───────┴───────┴───────┴───────┘
+```
+
+Updated 2026-11-28 (engine 0.6.0): up to 16 requests at once (`server.slots`, 4 by default), measured with
+`server/bench_lite.py` on the bench's coding item (≈9.4K-token context, effort max, default sampling, 2,048 tokens
+a stream, 16 slots):
+
+```
+┌──────────────────────────────────────────────────┬─────────┬─────────┬─────────┬─────────┐
+│ decode by streams at once (coding)               │       1 │       4 │       8 │      16 │
+├──────────────────────────────────────────────────┼─────────┼─────────┼─────────┼─────────┤
+│ total tok/s                                      │    71.0 │   128.1 │   183.0 │   246.8 │
+│ accepted                                         │     64% │     70% │     73% │     71% │
+└──────────────────────────────────────────────────┴─────────┴─────────┴─────────┴─────────┘
 ```
 
 Decode depends on how predictable the text is (accepted = drafts the model kept):
@@ -113,20 +127,21 @@ Decode depends on how predictable the text is (accepted = drafts the model kept)
 └────────────────────────────────────────────┴───────────┴──────────┴───────────┴──────────┘
 ```
 
-Prefill by prompt length, from one cold read of a 995K-token prompt (the server's `prefill_marks`, engine 0.4.0):
+Prefill by prompt length, updated 2026-11-28 (engine 0.6.0), from one cold read of a 990K-token prompt (the server's
+`prefill_marks`; 0.5.0: 625.8 s for 995K):
 
 ```
-┌──────────────────────────────────────┬───────┬───────┬────────┬────────┬───────┬─────────┐
-│ prefill by prompt length             │    8K │   32K │   128K │   256K │  512K │    995K │
-├──────────────────────────────────────┼───────┼───────┼────────┼────────┼───────┼─────────┤
-│ first token                          │ 2.1 s │ 8.8 s │ 40.2 s │ 92.6 s │ 235 s │ 625.8 s │
-│ tok/s                                │ 3,842 │ 3,730 │  3,264 │  2,830 │ 2,231 │   1,591 │
-└──────────────────────────────────────┴───────┴───────┴────────┴────────┴───────┴─────────┘
+┌──────────────────────────────────┬───────┬────────┬────────┬─────────┬─────────┬─────────┐
+│ prefill by prompt length         │    8K │    32K │   128K │    256K │    512K │    990K │
+├──────────────────────────────────┼───────┼────────┼────────┼─────────┼─────────┼─────────┤
+│ first token                      │ 2.1 s │  8.6 s │ 37.9 s │  85.6 s │ 209.2 s │ 522.7 s │
+│ tok/s                            │ 3,907 │  3,816 │  3,454 │   3,063 │   2,506 │   1,894 │
+└──────────────────────────────────┴───────┴────────┴────────┴─────────┴─────────┴─────────┘
 ```
 
-- Prompts are read one at a time in 8,192-row chunks (2.1 s each at the start of a prompt, 5.2 s at 512K); requests
+- Prompts are read one at a time in 8,192-row chunks (2.1 s each at the start of a prompt); requests
   that are decoding run a round between chunks. Four cold 128K prompts at once read at 3,281 tok/s in total.
-- A conversation that continues at 1M tokens (+8,136 new tokens, 99% reused) gets its first token in 10.8 s.
+- A conversation that continues at 1M tokens (+8,028 new tokens, 99% reused) gets its first token in 9.0 s (0.5.0: 10.8 s).
 - Copy drafts: a 1,591-token file rewritten with one edit goes from 92.9 to 311 tok/s (5.4 to 39 tokens a round),
   the same tokens; over HTTP at the default sampling 306.7 tok/s, the file exact.
 
@@ -137,10 +152,15 @@ Prefill by prompt length, from one cold read of a 995K-token prompt (the server'
   cached decode path; each layer also run alone on the engine's own input (differences at rounding level, the same
   routed experts).
 - **Every speed patch, on against off, bitwise** ([engine/tests/patch_check.py](engine/tests/patch_check.py)): a
-  16K-token prefill, prefill chunks, decode steps, multi-row and mixed-slot steps, DSpark drafts.
+  16K-token prefill, prefill chunks, decode steps, multi-row and mixed-slot steps (16 slots, 64- and 128-row verify
+  steps), DSpark drafts.
+- **Prefill kernels under the prefill rule pass the reference gate instead of bitwise**: gate.py runs each prompt with
+  the rule's patches off and on against the reference, and on must stay at off's noise floor; prefill stays
+  deterministic and chunk-invariant ([engine/tests/pf_check.py](engine/tests/pf_check.py)).
 - **Speculative decoding is plain decoding**: greedy DSpark rounds give plain greedy's tokens (448 thinking, 320 code
   tokens) with the kept rows' logits bitwise; copy rounds of 16 / 32 / 64 rows equal one-row steps bitwise, also at
-  140K context ([engine/tests/wide_check.py](engine/tests/wide_check.py)).
+  140K context, and a 16-sequence verify (128 rows) equals each sequence's 8 rows alone
+  ([engine/tests/wide_check.py](engine/tests/wide_check.py)).
 - **The server** ([checks/server_check.py](checks/server_check.py)): API paths and vLLM-shaped errors, streaming,
   thinking controls and budgets, tool calls (required / named / auto / none, streamed, parallel off), a closed stream
   stops its request, and three facts found at 10 / 50 / 90% of a 998,950-token prompt.
@@ -205,7 +225,8 @@ If a rank stops, both go down and the start says where the logs are. Logs of ear
 - Each rank holds 73.7 GiB of weights. The caches are ~4.5 KB a token on each node (HCA compressed entries and DSA
   latent / indexer rows), so a 1M-token request is ~4.5 GB a node.
 - After the warm-up the pool takes what is left on the node with less of it, less `memory_free_gib`, at most
-  `kv_pool_gib`. One request is at most 1,048,576 tokens (the model's limit); the pool is shared by the 4 slots.
+  `kv_pool_gib`. One request is at most 1,048,576 tokens (the model's limit); the pool is shared by the slots (4 by
+  default, up to 16; beside the pool each slot takes ~40 MB and each logit row ~3.2 MB, estimated).
 
 ```
 ┌──────────────────────────────┬────────────────┬────────────────────┬─────────────────────┐
@@ -238,8 +259,9 @@ If a rank stops, both go down and the start says where the logs are. Logs of ear
 | `paths.weights` | **required** | The checkpoint folder, the same path on both nodes |
 | `server.port`, `server.api_key` | `8888`, empty | HTTP port; with a key, `/v1/*` needs `Authorization: Bearer <key>` (`/health`, `/metrics` stay open) |
 | `server.served_name` | `baidu/ERNIE-5.5-Flash` | The model name in the API |
-| `server.slots` | `4` | Requests served at the same time |
+| `server.slots` | `4` | Requests served at the same time (1 … 16) |
 | `server.context`, `server.max_tokens` | `1048576`, `131072` | Tokens a request at most; reply tokens of a request that sends no `max_tokens` |
+| `server.decode_chunk` | `0` | Prompt rows a prefill step reads while others decode (0 = the whole chunk; ≥ 512: smoother streams, slower prompt) |
 | `server.memory_free_gib`, `server.kv_pool_gib` | `15`, `0` | Memory kept free on each node; a cap on the pool (0 = all the room) |
 | `server.checkpoints`, `server.checkpoint_every` | `8`, `8192` | Prefix checkpoints a slot keeps, and how often a prefill takes one |
 | `decode.dspark`, `decode.block` | `true`, `7` | DSpark, and draft tokens a round (`false`: plain decoding, the draft not loaded) |
@@ -276,10 +298,13 @@ looks like a special token is encoded as text, so only the template's own marker
 
 ## Engine patches
 
-[engine/src/model/patches.def](engine/src/model/patches.def) lists 96 numbered patches, one line each, 89 on by
+[engine/src/model/patches.def](engine/src/model/patches.def) lists 103 numbered patches, one line each, 95 on by
 default. The base implementation always stays; a patch adds a variant and has an off switch. A patch that changes
 arithmetic must be bitwise equal to the base (patch_check); the DSpark ones change only the drafts or how many are
-verified, never the output distribution.
+verified, never the output distribution. The one exception is the prefill rule: a prefill kernel (P210) may sum in its
+own order, keeping the reference's rounding points, determinism and batch / chunk invariance, and passes the reference
+gate at the noise floor instead; decode, verify and draft steps keep their bits, and a step's kind, not its size,
+chooses the kernel.
 
 | Patches | What they do |
 | --- | --- |
@@ -293,8 +318,10 @@ verified, never the output distribution.
 | 129–143 | DSpark draft attention and Markov chain, copy-engine staging, the shared expert sequence-parallel, the indexer split across ranks, the joint verify length |
 | 146–153 | Prefix checkpoints; long-context HCA attention and indexer select |
 | 160–180 | The sampled draft pass, mHC on verify steps, copy drafts, long-context HCA rescheduled, a zero-copy attention exchange |
+| 190–200 | Verify / draft steps of 5–16 sequences: the one-launch MoE, split weights, mHC, router / compressor and FP8 GEMMs at 33 … 128 rows |
+| 210 | Prefill HCA attention as one online softmax over a row's keys (the prefill rule) |
 
-Off by default (measured, not faster here): 74, 80, 83, 132, 160, 163, 180.
+Off by default (measured, not faster here): 74, 80, 83, 132, 160, 163, 180, 194.
 
 ## Layout
 

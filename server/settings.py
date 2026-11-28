@@ -118,6 +118,11 @@ def load(root=REPO, overrides=(), env=None):
             s[sec][k] = _typed(s[sec][k], raw, f"--set {o}")
         else:
             raise SettingsError(f"--set {o}: unknown setting {key}")
+    sv = s["server"]
+    if not 1 <= sv["slots"] <= 16:
+        raise SettingsError(f"server.slots must be 1 … 16 (the draft's rounds: ≤ 16 sequences), got {sv['slots']}")
+    if sv["decode_chunk"] < 0:
+        raise SettingsError(f"server.decode_chunk must be ≥ 0, got {sv['decode_chunk']}")
     p = s["paths"]
     for k in ("weights", "work"):
         if p[k]:

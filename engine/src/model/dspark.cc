@@ -682,7 +682,15 @@ void Engine::dsp_forward(const std::vector<SpecSeq*>& seqs, int M) {
     qlog::fail("dspark", "P08%d %s switched on after dspark_init (its copy was not built)", l4 ? 1 : 0,
                l4 ? "draft_lm4" : "draft_lm8");
   const Lin& lm = l4 ? d.lm4 : l8 ? d.lm8 : lm_;
-  lin_forward_f32(lm, t2_, lg_half_, M, s_);  // base logits of this rank's vocabulary half [M, Vh]
+  // base logits of this rank's vocabulary half [M, Vh]. P081's NVFP4 copy has only the decode kernel (M ≤ kDecodeRows):
+  // B ≥ 10 sequences × 7 drafts exceed it, so it runs in pieces of ≤ 64 rows — each row the same chain whatever the
+  // piece (linear.h: a row's result never depends on M or the other rows), so the drafts are bitwise the same
+  if (lm.fmt == WMat::NVFP4) {
+    for (int m0 = 0; m0 < M; m0 += kDecodeRows)
+      lin_forward_f32(lm, t2_ + size_t(m0) * kHidden, lg_half_ + size_t(m0) * lm.n, std::min(kDecodeRows, M - m0), s_);
+  } else {
+    lin_forward_f32(lm, t2_, lg_half_, M, s_);
+  }
   dmark(s_, "h.lm");
   (void)seqs;
 }
@@ -691,6 +699,7 @@ void Engine::spec_draft(const std::vector<SpecSeq*>& seqs) {
   Dsp& d = *dsp_;
   const int B = int(seqs.size());
   if (B < 1 || B > kDspMaxN) qlog::fail("dspark", "spec_draft: %d sequences", B);
+  const StepKind kind(false);  // a draft pass is decode kind (core/step_kind.h): the target's decode-bit kernels
   std::vector<int> ids, rs, ri, r0(B), lasts(B);
   std::vector<RowMeta> meta;
   int maxN = 0;
@@ -1052,7 +1061,7 @@ std::vector<std::vector<int>> Engine::spec_round(const std::vector<SpecSeq*>& se
   }
   verify_ = true;
   d.cok = patch::on(patch::ctx_side);  // P160: this round joins the side stream (the next draft pass, or below)
-  step(ids, pos, slot, ss, true);
+  step(ids, pos, slot, ss, true);  // (decode kind: prefill = false — the verify rows keep the decode bits at any M)
   verify_ = false, d.cok = false;
   CUDA_CHECK(cudaEventRecord(d.ev[1], s_));
   CUDA_CHECK(cudaMemcpyAsync(d.a_pst, ss.data(), (B + 1) * 4, cudaMemcpyHostToDevice, s_));
@@ -1195,7 +1204,7 @@ std::vector<int> Engine::spec_copy(SpecSeq& q, const std::vector<int>& copy, int
     penalty_add(d.a_pen, 1, nullptr, nullptr, nullptr, d.a_next, kVocab, s_);
   }
   verify_ = true;
-  step(ids, pos, {q.slot}, {0, M}, true);
+  step(ids, pos, {q.slot}, {0, M}, true);  // (decode kind, as spec_round's verify)
   verify_ = false;
   CUDA_CHECK(cudaEventRecord(d.ev[1], s_));
   std::vector<float> tmp(M, q.temp), tpp(M, q.top_p), mpp(M, q.min_p);

@@ -6,6 +6,7 @@
 #include "core/log.h"
 #include "kernels/attn/attn_common.cuh"
 #include "kernels/gemm/mma.cuh"
+#include "core/step_kind.h"
 #include "model/patches.h"
 
 namespace e55 {
@@ -618,7 +619,9 @@ void dsa_select(const uint8_t* qf4, const uint8_t* qs, const float* wts, const R
   if (M <= 0) return;
   if (patch::on(patch::dsa_select_long) && p153::run(qf4, qs, wts, meta, c, M, max_pos, list, cnt, ws, ws_bytes, s))
     return;
-  if (patch::on(patch::dsa_select_pf) && p091::run(qf4, qs, wts, meta, c, M, max_pos, list, cnt, ws, ws_bytes, s))
+  // P221 dsa_sel_v32: a decode / verify step's 17 … 64 rows on P046 with 1024-key splits (P091 / P046's rpc 8 × 4096:
+  // 12 CTAs at 4 × 8 rows and 9.6K candidates); the same lists
+  if (patch::on(patch::dsa_select_pf) && !p046::v32(M) && p091::run(qf4, qs, wts, meta, c, M, max_pos, list, cnt, ws, ws_bytes, s))
     return;
   if (patch::on(patch::dsa_select_fast) && p046::run(qf4, qs, wts, meta, c, M, max_pos, list, cnt, ws, ws_bytes, s))
     return;
@@ -635,6 +638,8 @@ void dsa_select(const uint8_t* qf4, const uint8_t* qs, const float* wts, const R
     CUDA_CHECK(cudaGetLastError());
   }
 }
+
+void dsa_select_cfg(int rpc, int kr) { p046::g_rpc = rpc, p046::g_kr = kr; }  // tests: P046's grid forced (0: rule)
 
 void dsa_select_tail(const RowMeta* meta, int M, int* list, int* cnt, cudaStream_t s) {
   if (M <= 0) return;

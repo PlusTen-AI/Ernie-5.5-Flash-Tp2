@@ -56,14 +56,22 @@ C="ernie55-tp2-$n"
 common="--label project=ernie-5.5-flash --user 1000:1000 -e HOME=/tmp -e HF_HOME=/tmp/hf --gpus all --ipc=host --network host --device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1:-1 -v $WORK:/work -v $MODELS:/models:ro -w $SRC${E55_TREE:+ -e E55_EXT_CACHE=/work/dev/$E55_TREE/ext}"
 pass=""; for v in E55_PATCHES E55_SYNC NCCL_DEBUG CUDA_LAUNCH_BLOCKING; do [ -n "${!v:-}" ] && pass="$pass -e $v=${!v}"; done
 cmd="$(printf '%q ' "$@")"
-# E55_GPU_LOCK=1: rank 1 holds B's GPU lock (tools/agent.sh --gpu) for its whole run, waiting for it first
+# E55_GPU_LOCK=1: A's and B's GPU locks (tools/agent.sh --gpu) are both taken BEFORE either rank starts (A first, then
+# B — one order everywhere), held by a sleep on each node for the whole run and released on exit. Starting rank 1 under
+# B's lock while rank 0 did not wait for A's let the two ranks start at different times (or run beside A's other work).
+lk=""
 if [ "${E55_GPU_LOCK:-0}" = 1 ]; then
-  on B "docker rm -f $C >/dev/null 2>&1; nohup flock $WORK/cache/gpu.lock docker run --name $C $common $(envs "$W") $pass ernie55-plus:dev $cmd --rank 1 --head-ip $head_ip >/dev/null 2>&1 &
-    for i in \$(seq 3600); do docker inspect $C >/dev/null 2>&1 && break; sleep 1; done" || bad tp2 "rank 1 did not start"
-else
-  on B "docker rm -f $C >/dev/null 2>&1; docker run -d --name $C $common $(envs "$W") $pass ernie55-plus:dev $cmd --rank 1 --head-ip $head_ip >/dev/null" \
-    || bad tp2 "rank 1 did not start"
+  lk=/tmp/ernie55-tp2lk-$n-$$.pid
+  hold() { on "$1" "rm -f $lk; nohup flock $WORK/cache/gpu.lock bash -c 'echo \$\$ > $lk; exec sleep 14400' >/dev/null 2>&1 &
+    until test -s $lk; do sleep 2; done"; }
+  release() { for x in A B; do on $x "test -s $lk && kill \$(cat $lk) 2>/dev/null; rm -f $lk"; done; }
+  trap release EXIT; trap 'exit 130' INT TERM
+  hold A || bad tp2 "GPU lock on A failed"
+  hold B || bad tp2 "GPU lock on B failed"
+  ok tp2 "GPU locks A · B held"
 fi
+on B "docker rm -f $C >/dev/null 2>&1; docker run -d --name $C $common $(envs "$W") $pass ernie55-plus:dev $cmd --rank 1 --head-ip $head_ip >/dev/null" \
+  || bad tp2 "rank 1 did not start"
 on A "mkdir -p $RUN; docker rm -f $C >/dev/null 2>&1; docker run --name $C $common $(envs "$H") $pass ernie55-plus:dev $cmd --rank 0 --head-ip $head_ip 2>&1 | tee $RUN/rank0.log"
 rc=$?
 on B "docker wait $C >/dev/null 2>&1; docker logs $C" > /tmp/.e55_r1.$$ 2>&1; on A "cat > $RUN/rank1.log" < /tmp/.e55_r1.$$; rm -f /tmp/.e55_r1.$$

@@ -17,13 +17,15 @@ ends, the server goes on.
 Watch: every MEM_POLL_S seconds (idle too: the loop wakes for it) both nodes' MemFree through one tiny collective
 (engine mem_free, mirrored to rank 1). Below server.memory_floor_gib on either node no new request is placed (one [mem]
 warn line; /health "low memory"); placing resumes when both are above it again. /metrics: pool chunks total / used /
-promised, MemFree per node (snapshot taken by the scheduler thread: the HTTP thread never calls the engine)."""
+promised, MemFree per node (snapshot taken by the scheduler thread at most every SNAP_S: the HTTP thread never calls the
+engine)."""
 import time
 
 import qlog
 
 SLACK = 64        # rows a request may write past its tokens in one call (DSpark verify rows, forced tokens)
 MEM_POLL_S = 5.0  # seconds between MemFree reads
+SNAP_S = 0.5      # seconds between two /metrics · /health snapshots of the pool (O(running requests) engine reads)
 
 
 class KvGuard:
@@ -39,7 +41,7 @@ class KvGuard:
                 m = (lo + hi + 1) // 2
                 lo, hi = (m, hi) if eng.kv_need(m + SLACK) <= self.total else (lo, m - 1)
         self.cap = lo if self.pool else ctx
-        self.low, self.free_gib, self.t_poll = False, [float("nan")] * 2, 0.0
+        self.low, self.free_gib, self.t_poll, self.t_snap = False, [float("nan")] * 2, 0.0, 0.0
         self.full_ends = 0  # replies ended with "length" because the pool was full (/metrics)
         self.throws = 0     # the engine's "KV pool full" (the accounting was wrong; should stay 0)
         self.snap = {}
@@ -93,7 +95,7 @@ class KvGuard:
             r.error = (f"This model's maximum context length is {self.max_tokens()} tokens. However, your prompt "
                        f"contains {L} input tokens, which exceeds what the server's cache memory holds for one request.")
             r.state = "done"
-            r.push([], "error")
+            sched._push(r, [], "error")
             return None
         T = min(self.cap, L + min(r.max_tokens, self.reserve)) + SLACK
         mapped = self.eng.kv_held(s.i)
@@ -130,7 +132,7 @@ class KvGuard:
                     self.full_ends += 1
                     qlog.warn("req", f"#{r.id}: the cache memory is full — reply ends at {r.n_out:,} tokens",
                               key=("kv full", r.id))
-                    r.push([], "length")
+                    sched._push(r, [], "length")
                     sched._finish(r, "length")
                     continue
             keep.append(r)
@@ -152,7 +154,7 @@ class KvGuard:
             if r is not None:
                 fin = "length" if r.n_out else "error"
                 r.error = "the server's cache memory is full"
-                r.push([], fin)
+                sched._push(r, [], fin)
                 sched._finish(r, fin)
             sched._reset(sched.slots[i])
             return None
@@ -173,6 +175,9 @@ class KvGuard:
                 qlog.ok("mem", f"MemFree rank0 {f[0]:.1f} · rank1 {f[1]:.1f} GiB — above the floor again: requests "
                                "are placed")
             self.low = low
+        elif now - self.t_snap < SNAP_S:
+            return
+        self.t_snap = now
         self.snap = {"total": self.total, "free": self.eng.kv_free() if self.pool else 0,
                      "promised": self.promised(sched) if self.pool else 0, "mem": list(self.free_gib), "low": self.low,
                      "full_ends": self.full_ends, "throws": self.throws}

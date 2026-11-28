@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """test_mhc.py — mHC (kernels/mhc): the base against an fp64 rendering of its math, the patches (P050 mhc_dec,
-P051 mhc_big, P072 mhc_fuse, P106 mhc_prefill, P107 mhc_rows_pdl, P164 mhc_verify) against the base bit for bit.
+P051 mhc_big, P072 mhc_fuse, P106 mhc_prefill, P107 mhc_rows_pdl, P164 mhc_verify, P192 mhc_verify64 (--v64)) against
+the base bit for bit.
   python3 engine/tests/test_mhc.py --model /models/ERNIE-5.5-Flash-Preview --table /work/cache/table.tsv [--all]
 Real mixers (mapping_proj fp32, bias, alphas, the fused RMSNorm weights) of layers 0–12; R bf16 with a realistic spread
 (per-dim log-normal scale, per-stream scale, outlier dims); post / comb from a real pre.
@@ -37,6 +38,7 @@ ap.add_argument("--table", required=True)
 ap.add_argument("--quick", action="store_true")
 ap.add_argument("--tune", action="store_true", help="P164: also every R (rows a warp chain), behind")
 ap.add_argument("--all", action="store_true", help="also the older sections (fn_b, fp64, every patch vs base, P106 / P107 times)")
+ap.add_argument("--v64", action="store_true", help="P192 mhc_verify64: 33 … 64 rows vs P051, bitwise, and µs per call")
 a = ap.parse_args()
 m = ext.load("mhc", ["src/kernels/mhc/mhc.cu", "src/model/patches.cc", "src/core/weights.cc", "tests/bind/lindec_spin.cu"])
 m.open(a.model, a.table)
@@ -53,7 +55,7 @@ def get(name):
     return files[f].get_tensor(name).cuda()
 
 
-PATCHES = ("mhc_dec", "mhc_big", "mhc_fuse", "mhc_prefill", "mhc_rows_pdl", "mhc_verify")
+PATCHES = ("mhc_dec", "mhc_big", "mhc_fuse", "mhc_prefill", "mhc_rows_pdl", "mhc_verify", "mhc_verify64")
 DEFAULT = ("mhc_dec", "mhc_big", "mhc_fuse")  # the state before P106 / P107
 CURRENT = ("mhc_dec", "mhc_big", "mhc_fuse", "mhc_prefill", "mhc_rows_pdl")  # the state before P164
 
@@ -192,6 +194,54 @@ def p164_section():
               f" {cn:6.2f} → {pn:6.2f} µs ({cn * 86e-3:.2f} → {pn * 86e-3:.2f} ms)" + (" · tune behind: " + ", ".join(tune) if tune else ""))
 
 
+def p192_section():
+    """P192 mhc_verify64 (with P164) vs the default (P051 at 33 … 64 rows) bitwise — R', post, comb, inp — for pre,
+    post + pre and layer-0 pre, 3 mixers, every forced R; then µs per post + pre call as p164_section."""
+    global ok
+    DEF = (*CURRENT, "mhc_verify")
+    for M in (33, 40, 47, 48, 56, 63, 64):
+        R = make_R(M, M)
+        out = make_out(M, M)
+        E = make_e(M, M)
+        z4, z16 = torch.zeros(M, 4, device="cuda"), torch.zeros(M, 16, device="cuda")
+        res = []
+        for (L, k) in [(1, 0), (7, 1), (12, 0)]:
+            h = H[(L, k)]
+            only()
+            _, p0, c0, _ = m.run(0, H[(L, 1 - k)], out, R, z4, z16)
+            cases = [(0, h, R, p0, c0), (1, h, R, p0, c0)] + ([(2, H[(0, 0)], E, z4, z16)] if (L, k) == (1, 0) else [])
+            for what, hh, RR, pp, cc in cases:
+                only(*DEF)
+                b = m.run(what, hh, out, RR, pp, cc)
+                for rr in (0, 2, 4, 8):
+                    if rr and rr * 8 < 16:
+                        continue
+                    m.p164_rows(rr)
+                    only(*DEF, "mhc_verify64")
+                    q = m.run(what, hh, out, RR, pp, cc)
+                    exact = all(same(x, y) for x, y in zip(b, q))
+                    ok &= exact
+                    if not exact:
+                        res.append(f"L{L}{'af'[k]} {('pre', 'post+pre', 'pre0')[what]} R={rr} DIFFERS {[same(x, y) for x, y in zip(b, q)]}")
+                m.p164_rows(0)
+        print(f"[P192 M={M}] pre, post+pre, layer-0 pre × 3 mixers × forced R: " + ("bit-identical" if not res else "; ".join(res)))
+    print("[time] post + pre, µs per call (as P164's), default (P051) → P192: behind a 10 µs predecessor · back to back")
+    for M in (40, 48, 56, 64):
+        R = make_R(M, 100 + M)
+        out = make_out(M, 100 + M)
+        only()
+        _, p0, c0, _ = m.run(0, hs[1], out, make_R(M, 200 + M), torch.zeros(M, 4, device="cuda"), torch.zeros(M, 16, device="cuda"))
+
+        def tm(spin):
+            return statistics.median(m.timed_batch(1, hs, out, R, p0, c0, 9, spin))
+        only(*DEF)
+        cb, cn = tm(10000), tm(0)
+        only(*DEF, "mhc_verify64")
+        pb, pn = tm(10000), tm(0)
+        print(f"  M={M:<3d} behind: {cb:6.2f} → {pb:6.2f} µs ({cb * 86e-3:.2f} → {pb * 86e-3:.2f} ms a step) · back to back:"
+              f" {cn:6.2f} → {pn:6.2f} µs ({cn * 86e-3:.2f} → {pn * 86e-3:.2f} ms)")
+
+
 def old_sections():
     global ok
     # 0. broadcast mixer
@@ -253,7 +303,10 @@ def old_sections():
         print(f"  M={M:<5d} {patch:12s} {b * 1e3:8.1f} → {q * 1e3:8.1f} µs ({(q - b) * 1e3:+.1f})  [{len(hl)} mixers in turn]")
 
 
-p164_section()
+if a.v64:
+    p192_section()
+else:
+    p164_section()
 if a.all:
     old_sections()
 only()

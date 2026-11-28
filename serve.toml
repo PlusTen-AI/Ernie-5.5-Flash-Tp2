@@ -38,7 +38,14 @@ image = "ernie55-plus"
 served_name = "baidu/ERNIE-5.5-Flash"
 host = "0.0.0.0"
 port = 8888
-slots = 4               # requests served at the same time
+# Requests served at the same time (1 … 16): every DSpark round verifies all decoding ones in one target step (up to
+# block + 1 rows each) and drafts them in one pass, so the round's rows grow with them, not its count. The engine keeps
+# max(slots × (block + 1), decode.copy_rows) logit rows. Fixed memory per node beside the KV pool (each running
+# request's caches come from the pool as it grows): ~40 MB a slot (HCA windows and compressor states 22, the draft's
+# q rows 13, its context rows 5) + ~3.2 MB a logit row — 4 slots ~0.36 GB, 8 ~0.52 GB (+0.15 GiB), 16 ~1.05 GB
+# (+0.64 GiB) (estimate from the engine's buffer sizes). decode.verify "cost"'s round table is measured at 1 / 4 / 8 / 16
+# sequences, and verify steps are checked bitwise up to 128 rows (16 slots). More requests than slots wait for one.
+slots = 4
 # Tokens per request at most (prompt + output), up to 1,048,576 (the model's limit). With the KV pool (patches.kv_pool,
 # on by default) this costs no memory up front: the caches come from the pool as a request grows (~4.4 KiB a token on
 # each node), and the HTTP front's max_model_len is this or what the whole pool holds, whichever is less. Without the
@@ -48,6 +55,13 @@ context = 1048576
 # left in the context. A request's own value wins (cut to the room as vLLM does).
 max_tokens = 131072
 chunk = 8192            # prompt rows per prefill step (8192: the experts read once per 8192 rows — measured 1,304 vs 1,398 ms per 4096 rows)
+# Prompt rows a prefill step reads while other requests are decoding (0 = chunk): a new prompt's chunk is then read in
+# pieces of this many rows (≥ 512; the chunk's rest ≥ 512) with a decode round between two, so the running replies
+# wait one piece (~0.32 ms a row) instead of a whole chunk (8192 rows ~2.6 s). The same output (every kernel is
+# batch-invariant: a row gets the same bits in any piece; checkpoints stay at the chunks' ends); the prompt takes
+# longer (smaller steps read the experts more often: +7 % at 4096 by the measurement above, more below it) and the
+# replies' total wait stays about the same, so 0 is the most throughput; set it for smoother streams.
+decode_chunk = 0
 # KV pool: after a warm-up of the serving paths at start, the pool takes all the memory left on the node with less of
 # it, less memory_free_gib (kept free for the system; GB10's CUDA allocates from free pages, so MemFree counts, not the
 # page cache), at most kv_pool_gib (0 = no cap); both nodes take the same. A request is placed when the pool holds its
@@ -105,7 +119,7 @@ gate = 0.3
 # the reply is the one it gets without copying; a wrong copy only costs rows. Rounds shared by several requests are
 # never copy rounds. false = DSpark rounds only.
 copy = true
-copy_rows = 64          # verify rows of a copy round at most (2 … 64; the engine keeps max(slots × (block + 1), this) logit rows)
+copy_rows = 64          # verify rows of a copy round at most (2 … 64; the engine keeps max(slots × (block + 1), this) logit rows: free from 8 slots up)
 copy_match = 8          # tokens the reply's tail must repeat before a copy is offered (each copy not taken whole doubles it, up to 8×)
 
 [thinking]

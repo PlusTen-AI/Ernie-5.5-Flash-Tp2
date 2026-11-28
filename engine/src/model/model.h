@@ -97,7 +97,7 @@ class Engine {
   // full rows (both collectives: every rank calls them in the same order).
   const float* step(const std::vector<int>& ids, const std::vector<int>& pos, const std::vector<int>& slot,
                     const std::vector<int>& seq_start, bool all_logits, const std::vector<int>& rows = {},
-                    bool gather = true);
+                    bool gather = true, bool prefill = false);  // prefill: the step's kind (core/step_kind.h), set by the caller
   // P063: both ranks' top-kSparseK records of the last step's rows (its half as it is now — penalties applied by the
   // caller go in): device [2][R][kSparseRec]
   const SparseCand* sparse_cands();

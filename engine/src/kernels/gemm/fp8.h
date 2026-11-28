@@ -15,7 +15,8 @@
 // P060 f8_fuse_ops (F8Act::pro, F8Out::epi, F8Aux: the decode path's norms / gates / SiTU / sum inside the GEMM launch),
 // P103 f8_tile (prefill M ≥ 256: 128 × 128 tiles, K splits as clusters, p103_f8_tile.cuh), P104 f8_tile_epi (the
 // M > 32 epilogues in P103's store, kEpiMulQ128), P133 f8_tile_seq (prefill M ≥ 256 with a K split: 128-row tiles,
-// the chains one after the other in the same warps, p133_f8_seq.cuh).
+// the chains one after the other in the same warps, p133_f8_seq.cuh), P200 f8_mid (33 ≤ M ≤ 128: P030's chain and
+// cluster sum with 32 / 64-row token tiles a CTA, the activation through a cp.async ring, p200_f8_mid.cuh).
 #pragma once
 #include <initializer_list>
 #include <string>
@@ -122,6 +123,7 @@ inline F8Act f8_pro(int op, const bf16* x, int ldx, const bf16* pw, int pld, uin
   a.x = x, a.ldx = ldx, a.pro = op, a.pw = pw, a.pld = pld;
   return a;
 }
+int f8_test_mid(int mt);  // tests: P200's token tile 32 / 64 / 128 for every shape it runs (0: the measured rule); returns the previous one
 int f8_test_pfn(int n);  // tests: P064's L2 prefetch depth in k32 blocks per warp (0: none); returns the previous one
 int f8_test_seq(int c);  // tests: P133's tile config 0–3 for every shape it can take (−1: the measured choice)
 const char* f8_test_path(const F8Lin& L, int M, int epi);  // tests: which kernel f8_forward(_out) takes (P031, P103 …)

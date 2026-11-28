@@ -14,6 +14,8 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+#include "core/step_kind.h"  // step_prefill(): the running step's kind (prefill chunk vs decode / verify / draft)
+
 namespace e55 {
 
 using bf16 = __nv_bfloat16;

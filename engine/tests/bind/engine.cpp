@@ -95,9 +95,11 @@ void engine_close() {
   g_e.reset();
 }
 
+// prefill: the step's kind (core/step_kind.h) — true for a prompt chunk (the prompt's last chunk, a forced-token
+// injection), false (default) for decode rows; the caller says it, the engine never infers it from M
 torch::Tensor step(const std::vector<int>& ids, const std::vector<int>& pos, const std::vector<int>& slot,
-                   const std::vector<int>& seq_start, bool all_logits, const std::vector<int>& rows) {
-  const float* lg = g_e->step(ids, pos, slot, seq_start, all_logits, rows);
+                   const std::vector<int>& seq_start, bool all_logits, const std::vector<int>& rows, bool prefill) {
+  const float* lg = g_e->step(ids, pos, slot, seq_start, all_logits, rows, true, prefill);
   const int R = g_e->logit_rows_last();
   auto out = torch::empty({R, e55::kVocab}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
   cudaMemcpyAsync(out.data_ptr<float>(), lg, size_t(R) * e55::kVocab * 4, cudaMemcpyDeviceToDevice, g_e->stream());
@@ -105,21 +107,23 @@ torch::Tensor step(const std::vector<int>& ids, const std::vector<int>& pos, con
   return out;
 }
 
-// A step that only fills caches (a prompt chunk before its last): the logits of its last rows are not used.
+// A step that only fills caches (a prompt chunk before its last): the logits of its last rows are not used. Always
+// prefill kind (core/step_kind.h).
 void fill(const std::vector<int>& ids, const std::vector<int>& pos, const std::vector<int>& slot,
           const std::vector<int>& seq_start) {
-  g_e->step(ids, pos, slot, seq_start, false);
+  g_e->step(ids, pos, slot, seq_start, false, {}, true, true);
 }
 
 // A step, then one token per sequence from its last row. Per sequence b: temp (0 = greedy), top_k (0 = off), top_p,
 // min_p, seed and ctr (Philox counter: the caller passes the new token's position, so a token never depends on
 // batching), penalties (rep, freq, pres; (1, 0, 0) = off — a penalised sequence needs pen_begin first, its sampled
-// token is counted here). Returns the tokens (host).
+// token is counted here). prefill: the step's kind, as step() (the prompt's last chunk: true; decode: false).
+// Returns the tokens (host).
 std::vector<int> run(const std::vector<int>& ids, const std::vector<int>& pos, const std::vector<int>& slot,
                      const std::vector<int>& seq_start, const std::vector<double>& temp, const std::vector<int>& top_k,
                      const std::vector<double>& top_p, const std::vector<double>& min_p,
                      const std::vector<int64_t>& seed, const std::vector<int64_t>& ctr, const std::vector<double>& rep,
-                     const std::vector<double>& freq, const std::vector<double>& pres) {
+                     const std::vector<double>& freq, const std::vector<double>& pres, bool prefill) {
   const int B = int(slot.size());
   if (B > g_s.cap) qlog::fail("run", "%d sequences > %d", B, g_s.cap);
   cudaStream_t s = g_e->stream();
@@ -127,7 +131,7 @@ std::vector<int> run(const std::vector<int>& ids, const std::vector<int>& pos, c
   // records instead of all-gathered full rows — the same tokens; the halves are penalised in place first
   bool sp = e55::patch::on(e55::patch::sparse_wire);
   for (int b = 0; b < B && sp; b++) sp = e55::sparse_ok(float(temp[b]), top_k[b], float(top_p[b]), e55::kVocab);
-  float* lg = const_cast<float*>(g_e->step(ids, pos, slot, seq_start, false, {}, !sp));
+  float* lg = const_cast<float*>(g_e->step(ids, pos, slot, seq_start, false, {}, !sp, prefill));
   std::vector<float> t(B), tp(B), mp(B);
   std::vector<uint64_t> sd(B), ct(B);
   std::vector<e55::PenSeq> pq(B);
@@ -330,16 +334,17 @@ void warm_up() {
   reset(0);
   fill(ids(R, 0), seq(0, R), {0}, {0, R});
   int p = R;
-  int t = run({ids(1, p)[0]}, {p}, {0}, {0, 1}, {0.0}, {0}, {1.0}, {0.0}, {1}, {p + 1}, {1.1}, {0.0}, {0.0})[0];
+  int t = run({ids(1, p)[0]}, {p}, {0}, {0, 1}, {0.0}, {0}, {1.0}, {0.0}, {1}, {p + 1}, {1.1}, {0.0}, {0.0}, false)[0];
   p++;
-  t = run({t}, {p}, {0}, {0, 1}, {1.0}, {0}, {1.0}, {0.0}, {2}, {p + 1}, {1.0}, {0.0}, {0.0})[0];
+  t = run({t}, {p}, {0}, {0, 1}, {1.0}, {0}, {1.0}, {0.0}, {2}, {p + 1}, {1.0}, {0.0}, {0.0}, false)[0];
   p++;
   const int v = std::min(LR, R);
-  g_e->step(ids(v, p), seq(p, v), {0}, {0, v}, true);
+  g_e->step(ids(v, p), seq(p, v), {0}, {0, v}, true);  // (decode kind: the verify-size kernels, ≤ logit_rows rows)
   p += v;
   std::vector<int> tk(S), ps(S), sl(S), st(S + 1);
   for (int s = 0; s < S; s++) tk[s] = 1000 + s, ps[s] = s ? 0 : p, sl[s] = s, st[s + 1] = s + 1;
-  g_e->step(tk, ps, sl, st, false);  // (gathered rows: spec_begin samples its first token from them)
+  g_e->step(tk, ps, sl, st, false);  // (gathered rows: spec_begin samples its first token from them; decode kind: it
+                                     // mixes slot 0's next row with the other slots' first rows)
   if (g_e->dspark() && LR >= 2 * S) {  // (a round verifies 1 + depth rows a sequence)
     const int depth = std::min(15, LR / S - 1);
     for (int s = 0; s < S; s++) spec_begin(s, depth, 0.0, s + 1, s, 0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, true);
@@ -398,9 +403,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("ctx"), py::arg("max_rows"), py::arg("logit_rows"), py::arg("port"), py::arg("pool_warm") = false, nogil());
   m.def("close", &engine_close, nogil());
   m.def("step", &step, py::arg("ids"), py::arg("pos"), py::arg("slot"), py::arg("seq_start"), py::arg("all_logits"),
-        py::arg("rows") = std::vector<int>{}, nogil());
-  m.def("fill", &fill, nogil());
-  m.def("run", &run, nogil());
+        py::arg("rows") = std::vector<int>{}, py::arg("prefill") = false, nogil());
+  m.def("fill", &fill, nogil());  // (prefill kind)
+  // (positional calls as before; the server passes prefill positionally: its command link forwards no keywords)
+  m.def("run", &run, py::arg("ids"), py::arg("pos"), py::arg("slot"), py::arg("seq_start"), py::arg("temp"),
+        py::arg("top_k"), py::arg("top_p"), py::arg("min_p"), py::arg("seed"), py::arg("ctr"), py::arg("rep"),
+        py::arg("freq"), py::arg("pres"), py::arg("prefill") = false, nogil());
   m.def("pen_begin", &pen_begin, nogil());
   m.def("pen_add", &pen_add, nogil());
   m.def("sync_mode", &sync_mode);

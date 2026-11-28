@@ -13,6 +13,7 @@ lm_head (12-bit only).
    router pair, compressor pair (8 layers each), indexer k (the 6 DSA layers), lm_head at M = 1, 4, 8 — current →
    P114 · P115 · both; the pairs also behind a 10 µs predecessor (lindec_spin.cu: the call a programmatic dependent
    whose prologue runs under it, as in the engine; the 10 µs subtracted)
+--rows64 (P193 lin_small64) instead: 1. at M = 33 … 64 (P165 on: the default) and 2. µs per call at M = 40 … 64
   tools/agent.sh lindec --gpu python3 engine/tests/test_lindec.py --model /models/ERNIE-5.5-Flash-Preview --table /work/cache/table.tsv"""
 import argparse
 import os
@@ -30,6 +31,7 @@ ap.add_argument("--model", required=True)
 ap.add_argument("--table", required=True)
 ap.add_argument("--log", default="/tmp/build-lindec.log")
 ap.add_argument("--all", action="store_true", help="also section 3 (P114 / P115 per-call times)")
+ap.add_argument("--rows64", action="store_true", help="P193 lin_small64: bitwise and µs at 33 … 64 rows instead")
 a = ap.parse_args()
 m = ext.load("lindec", ["src/kernels/linear/linear.cu", "src/core/weights.cc", "src/model/patches.cc",
                         "tests/bind/lindec_spin.cu"], log=a.log)
@@ -60,7 +62,10 @@ for tag, hs in (("router", router), ("compressor", comp), ("indexer k", ikw), ("
 
 CFG = {"current": (False, False, 0, False), "P114": (True, False, 0, False), "P115": (False, True, 0, False),
        "both": (True, True, 0, False), "both W2": (True, True, 2, False), "both W4": (True, True, 4, False),
-       "both+P165": (True, True, 0, True)}
+       "both+P165": (True, True, 0, True),
+       # P193 lin_small64 (5th field): the P114 / P115 kernels at 33 … 64 rows
+       "+P193": (True, True, 0, True, True), "+P193 W1": (True, True, 1, True, True), "+P193 W2": (True, True, 2, True, True),
+       "+P193 W4": (True, True, 4, True, True)}
 
 
 def setp(c):
@@ -68,6 +73,7 @@ def setp(c):
     m.set_patch("lin_small", CFG[c][1])
     m.warps(CFG[c][2])
     m.set_patch("lin_small2", CFG[c][3])
+    m.set_patch("lin_small64", len(CFG[c]) > 4 and CFG[c][4])
 
 
 def bits(t):
@@ -87,6 +93,39 @@ def outs(x):
 
 ok = True
 torch.manual_seed(0)
+if a.rows64:  # P193: bitwise vs the default at 33 … 64 rows (lin_kernel there), then µs per call (as section 2)
+    for M in (33, 40, 47, 48, 56, 64):
+        x = torch.randn(M, 4096, device="cuda").bfloat16()
+        setp("both+P165")
+        ref = outs(x)
+        res = []
+        for c in ("+P193", "+P193 W1", "+P193 W2", "+P193 W4"):
+            setp(c)
+            same = all(torch.equal(u, v) for u, v in zip(outs(x), ref))
+            ok &= same
+            res.append(f"{c} {'identical' if same else 'DIFFERENT'}")
+        print(f"[lindec] bitwise M={M}: " + " · ".join(res))
+    md = statistics.median
+    print("[lindec] P193: µs per call (16 layers in turn, median of 9 rounds), off → on: behind a 10 µs predecessor ·"
+          " back to back (pair: P191's halves; whole: P078 off)")
+    for M in (40, 48, 56, 64):
+        x = torch.randn(M, 4096, device="cuda").bfloat16()
+        line = []
+        for tag in ("router", "compressor"):
+            for kind, hs, nm in ((2, [h for p in pairs[tag][0] for h in p], "pair"),
+                                 (0, router if tag == "router" else comp, "whole")):
+                t = {}
+                for c in ("both+P165", "+P193"):
+                    setp(c)
+                    t[c, 1] = statistics.median(m.timed_batch(kind, hs, x, 9, 10000))
+                    t[c, 0] = statistics.median(m.timed_batch(kind, hs, x, 9, 0))
+                line.append(f"{tag} {nm} {t['both+P165', 1]:.2f} → {t['+P193', 1]:.2f} · "
+                            f"{t['both+P165', 0]:.2f} → {t['+P193', 0]:.2f}")
+        print(f"[lindec] M={M}: " + " | ".join(line))
+    setp("current")
+    m.free_all()
+    print("[lindec] " + ("PASS" if ok else "FAIL"))
+    sys.exit(0 if ok else 1)
 for M in (1, 4, 8, 16, 32):
     x = torch.randn(M, 4096, device="cuda").bfloat16()
     setp("current")

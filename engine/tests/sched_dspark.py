@@ -17,9 +17,12 @@ Serving shapes (4 slots × 64K, chunk 8192, block 7, gate 0.3); two prompts: thi
            frequency / presence penalties, sampled T 1.0 / top_p 0.95; the fifth waits for a slot), so rounds mix B = 1 … 4
            and prefill chunks cut in between rounds: every greedy request's tokens == its own plain decoding alone (the
            penalised one: with the same penalties), its prompt's last row and every kept verify row's logits bitwise
-           plain greedy step()'s; the sampled one ends with sane text
+           plain greedy step()'s; the sampled one ends with sane text. --slots 8 / 16: greedy requests of their own
+           (x0 …, distinct prompts) up to slots + 1, so rounds reach B = slots (verify 64 / 128 rows) — each one's
+           tokens and kept rows as above; PASS needs a round with every slot
   cost     P143's table: sampled rounds over 4 sequences at context ≈ 9.4K, every draft verified up to a cap c (R = 4c,
-           c = 1 2 3 4 6 8): verify step ms by total rows (+ the draft's context rows), and the rest of a round
+           c = 1 2 3 4 6 8): verify step ms by total rows (+ the draft's context rows), and the rest of a round;
+           --cost-b 4,8,16 (with --slots 16): the same at B = 8 / 16 (R ≤ logit rows: 64 / 128)
   rate     T 1.0 / top_p 0.95, thinking and code prompts, c = 1 (--mlen tokens) and c = 4 (--mlen4 a stream, seeds
            differ): decode.verify "gate" (P121, --gate) vs "cost" (P143, the table from `cost` + the gate runs) — rounds
            with B = c: emitted tokens per ms of rounds (derived tok/s; wall from a round's start to the next one's) and
@@ -66,6 +69,8 @@ ap.add_argument("--mlen4", type=int, default=384, help="rate: tokens a stream at
 ap.add_argument("--verify", default="cost", help="multi / kvwait: decode.verify")
 ap.add_argument("--kv-gib", type=float, default=0.2, help="kvwait: kv_pool_gib")
 ap.add_argument("--do", default="exact,measure")
+ap.add_argument("--cost-b", default="4", help="cost: sequences of the table's rounds (each ≤ --slots), e.g. 4,8,16")
+ap.add_argument("--rate-c", default="1,4", help="rate: concurrent streams (each ≤ --slots), e.g. 1,4,8,16")
 a = ap.parse_args()
 R0 = a.rank == 0
 SEED = 1234
@@ -156,8 +161,8 @@ class Tap:
     def __getattr__(self, n):
         return getattr(E, n)
 
-    def step(self, ids, pos, slot, ss, all_logits):
-        out = E.step(ids, pos, slot, ss, all_logits)
+    def step(self, ids, pos, slot, ss, all_logits, rows=(), prefill=False):  # (prefill: the step's kind)
+        out = E.step(ids, pos, slot, ss, all_logits, list(rows), prefill)
         self.c["pf"] = bool(torch.equal(out[0], self.ref[pos[-1]]))
         return out
 
@@ -255,7 +260,13 @@ def drive(eng, specs, block, verify="gate", at=None, kv=None):
     round at[i] (eng: an MTap) → {name: (Req, emitted tokens, finish, round it finished)}"""
     s = Scheduler(eng, chat.eos, a.slots, a.ctx, a.chunk, think_end=chat.think_end, loop_guard=True, block=block,
                   gate=a.gate, kv=kv, verify=verify)
-    res, later = {}, []
+    res, later, ends = {}, [], {}
+    f0 = s._finish
+
+    def finish(r, why):  # the round a request ends in (its finish push is held until the next engine call)
+        ends.setdefault(r.label, getattr(eng, "rounds", 0))
+        f0(r, why)
+    s._finish = finish
     for i, sp in enumerate(specs):
         got, fin = [], []
 
@@ -276,7 +287,8 @@ def drive(eng, specs, block, verify="gate", at=None, kv=None):
         raise ValueError("arrivals by round need an MTap")
     s.drain(time.time() + 1e9)
     s.run()
-    out = {n: (r, got, (fin or [("?", -1)])[0][0], (fin or [("?", -1)])[0][1]) for n, (r, got, fin) in res.items()}
+    out = {n: (r, got, (fin or [("?", -1)])[0][0], ends.get(n, (fin or [("?", -1)])[0][1]))
+           for n, (r, got, fin) in res.items()}
     if isinstance(eng, MTap) and eng.pending:
         say(f"  {len(eng.pending)} arrivals never submitted (every request ended first)")
     return out
@@ -332,9 +344,9 @@ class MTap:
         self._cut()
         return E.fill(ids, pos, slot, ss)
 
-    def step(self, ids, pos, slot, ss, all_logits):
+    def step(self, ids, pos, slot, ss, all_logits, rows=(), prefill=False):  # (prefill: the step's kind)
         self._cut()
-        out = E.step(ids, pos, slot, ss, all_logits)
+        out = E.step(ids, pos, slot, ss, all_logits, list(rows), prefill)
         nm = self._name(slot[0]) if len(slot) == 1 else None
         if nm in self.refs:
             ref = self.refs[nm].get(pos[-1])
@@ -387,11 +399,30 @@ def multi_specs():
                  top_k=D["top_k"] if D["top_k"] > 0 else 0, top_p=float(D["top_p"]), seed=7)]
 
 
+# multi at --slots > 4: greedy requests of their own (distinct prompts, thinking off) up to slots + 1 (one waits), so
+# rounds reach B = slots (verify 8 · B rows at block 7: 64 at 8 slots, 128 at 16)
+TOPICS = ["the water cycle", "binary search", "photosynthesis", "a TCP handshake", "hash tables", "black holes",
+          "how vaccines work", "the Pythagorean theorem", "what a compiler does", "plate tectonics", "neural networks",
+          "public-key cryptography"]
+
+
+def extra_specs(n):
+    out = []
+    for k in range(n):
+        msgs = [{"role": "user", "content": f"In about 100 words, explain {TOPICS[k % len(TOPICS)]}."}]
+        pr = chat.encode_chat(chat.render(normalize_messages(msgs), None, thinking=False, level="high"))
+        out.append(dict(name=f"x{k}", prompt=pr, mt=128, thinking=False))
+    return out
+
+
 REFS, PLAIN = {}, {}
 
 
 def multi():
     specs = multi_specs()
+    nx = max(0, a.slots + 1 - len(specs))
+    specs += extra_specs(nx)
+    at = [0, 3, 6, 10, 16] + [1 + k + k // 3 for k in range(nx)]  # the extras between the first five's arrivals
     for sp in specs:
         if sp.get("temp", 0.0) > 0:
             continue
@@ -407,7 +438,7 @@ def multi():
                f" positions (the rest forced </think>: {len(forced)}/{len(mism)})"))
     tap = MTap(REFS)
     E.spec_stats(True)
-    res = drive(tap, specs, a.block, a.verify, at=[0, 3, 6, 10, 16])
+    res = drive(tap, specs, a.block, a.verify, at=at)
     S = E.spec_stats(True)
     allok = True
     for sp in specs:
@@ -440,20 +471,30 @@ def multi():
                 f"{tap.placed.get(nm, 0)} · ended at round {rd} · text: {txt[:200]!r}")
     say(f"[multi] {S['rounds']:.0f} rounds by B {dict(sorted(tap.byB.items()))} · {S['rows'] / max(1, S['rounds']):.2f} "
         f"verify rows · {S['emitted'] / max(1, S['seqs']):.2f} tokens a sequence and round · prefill steps while others "
-        f"decoded {tap.cutin} · all: {'PASS' if allok and set(tap.byB) >= {1, 2, 3, 4} else 'FAIL'}")
+        f"decoded {tap.cutin} · all: {'PASS' if allok and set(tap.byB) >= {1, 2, 3, 4} and max(tap.byB) == a.slots else 'FAIL'}")
     for i in range(a.slots):
         E.reset(i)
 
 
 def cost():
-    """P143's table: 4 slots at ≈ 9.4K (the README's tokens, other offsets), sampled rounds with every draft verified up
-    to the cap c (gate 0: R = 4c)"""
+    """P143's table: B (--cost-b) slots at ≈ 9.4K (the README's tokens, other offsets), sampled rounds with every draft
+    verified up to the cap c (gate 0: R = B·c; c ≤ 8 and B·c ≤ logit rows) → {B: {R: target step ms}}"""
+    out = {}
+    for B in (int(x) for x in a.cost_b.split(",") if x):
+        if B > a.slots:
+            say(f"[cost] B {B} > {a.slots} slots: skipped")
+            continue
+        out[B] = cost_b(B)
+    return out
+
+
+def cost_b(B):
     D = chat.defaults
     temp, top_p, top_k = float(D["temperature"]), float(D["top_p"]), (D["top_k"] if D["top_k"] > 0 else 0)
     text = open(os.path.join(a.model, "README.md"), encoding="utf-8").read()
     toks = chat.encode(text)
-    toks = toks * (16000 // len(toks) + 1)
-    n, slots = 9400, list(range(4))
+    n, slots = 9400, list(range(B))
+    toks = toks * ((n + 1000 * B) // len(toks) + 1)
     for s in slots:
         E.reset(s)
         ids = toks[s * 1000:s * 1000 + n]
@@ -466,20 +507,22 @@ def cost():
         E.spec_begin(s, a.block, temp, SEED + s, 0, top_k, top_p, 0.0, 1.0, 0.0, 0.0, 0.0, True)
     tab, rest = {}, []
     for c in (1, 2, 3, 4, 6, 8):
+        if B * c > LR:
+            continue
         for _ in range(2):
-            E.spec_round(slots, True, [c] * 4)
+            E.spec_round(slots, True, [c] * B)
         E.spec_stats(True)
         v, x, other = [], [], []
         for _ in range(8):
-            E.spec_round(slots, True, [c] * 4)
+            E.spec_round(slots, True, [c] * B)
             S = E.spec_stats(True)
-            if S["rows"] != 4 * c:
-                say(f"  cap {c}: {S['rows']:.0f} rows (expected {4 * c})")
+            if S["rows"] != B * c:
+                say(f"  cap {c}: {S['rows']:.0f} rows (expected {B * c})")
             v.append(S["ms_verify"]), x.append(S["ms_ctx"])
             other.append(S["ms_accept"] + S["ms_commit"] + S["ms_draft"])
-        tab[4 * c] = (statistics.median(v), statistics.median(x), statistics.median(other))
+        tab[B * c] = (statistics.median(v), statistics.median(x), statistics.median(other))
         rest += other
-    say("[cost] B 4 at ≈ " + f"{E.spec_pos(0):,}" + ": verify step ms by total rows (target step + the draft's context "
+    say(f"[cost] B {B} at ≈ " + f"{E.spec_pos(0):,}" + ": verify step ms by total rows (target step + the draft's context "
         "rows; median of 8 rounds): " + " · ".join(f"R {R} {t + c:.1f} ({t:.1f} + {c:.2f})" for R, (t, c, _) in tab.items())
         + f" · the rest of a round (accept + commit + next drafts, depth {a.block}) {statistics.median(rest):.2f} ms")
     for s in slots:
@@ -487,10 +530,11 @@ def cost():
     return {R: t for R, (t, _, _) in tab.items()}
 
 
-COST = {}  # cost()'s table for rate: v4 {R: target step ms}
+COST = {}  # cost()'s tables for rate: {B: {R: target step ms}}
 
 
 def rate():
+    RC = [c for c in (int(x) for x in a.rate_c.split(",") if x) if c <= a.slots]
     D = chat.defaults
     temp, top_p, top_k = float(D["temperature"]), float(D["top_p"]), (D["top_k"] if D["top_k"] > 0 else 0)
     res = {}
@@ -499,13 +543,13 @@ def rate():
             # the verify target step by rows: B = 1 step_prof's (32.0 / 43.3 / 57.1 ms at 1 / 4 / 8 rows, 9.4K), B = 4
             # `cost`'s; the rest of a round (wall start to start less the target step: context rows, accept, commit,
             # next drafts, the scheduler) as the gate runs had it at B = 1 / 4
-            rest = [(c, statistics.mean(x["restw"] for k, x in res.items() if k[1] == c)) for c in (1, 4)]
+            rest = [(c, statistics.mean(x["restw"] for k, x in res.items() if k[1] == c)) for c in RC]
             vt = {1: ((1, 32.0), (4, 43.3), (8, 57.1))}
-            if COST:
-                vt[4] = tuple(sorted(COST["v4"].items()))
+            for B, t in sorted(COST.items()):
+                vt[B] = tuple(sorted(t.items()))
             scheduler.ROUND_VERIFY_MS, scheduler.ROUND_REST_MS = vt, tuple(rest)
             say(f"[rate] cost table: verify {vt} · rest " + ", ".join(f"B {c}: {r:.2f}" for c, r in rest))
-        for c in (1, 4):
+        for c in RC:
             for name in PROMPTS:
                 prompt, th = encode(name)
                 specs = [dict(name=f"{name}{i}", prompt=prompt, mt=a.mlen if c == 1 else a.mlen4, thinking=th, temp=temp,
@@ -537,7 +581,7 @@ def rate():
                             by[y[1]].append(y[5])
                     say("  B 1 target step ms by rows: " + " · ".join(f"R {R} {statistics.median(v):.1f} (×{len(v)})"
                                                                       for R, v in sorted(by.items())))
-    for c in (1, 4):
+    for c in RC:
         for name in PROMPTS:
             g, k = res[("gate", c, name)], res[("cost", c, name)]
             say(f"[rate] c {c} · {name}: gate {a.gate} {g['tps']:.1f} → cost {k['tps']:.1f} tok/s derived "
@@ -594,6 +638,6 @@ for what in a.do.split(","):
     t = time.time()
     out = globals()[what]()
     if what == "cost":
-        COST["v4"] = out
+        COST.update(out)
     say(f"[sched] {what} · {time.time() - t:.0f} s")
 E.close()

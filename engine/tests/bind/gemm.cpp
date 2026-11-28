@@ -324,6 +324,9 @@ void site(const std::string& k, const std::vector<int>& h, const std::vector<tor
     }
   } else if (k == "moe.fc1") {  // 964 ffn_front: fc1 + the latent's MXFP8 copy. T: xq, xs, t2, lq, ls
     f8_forward_out({&L(0), P(T[2]), 2048, kEpiQ32, nullptr, 0, U(3), U(4)}, F8Act{U(0), U(1), 4096}, M, ws, s);
+  } else if (k == "moe.front") {  // 1218 ffn_front at decode: fc1 + the latent's MXFP8 copy and the shared gate/up, one call. T: xq, xs, t2, lq, ls, t1
+    f8_forward_multi({{&L(0), P(T[2]), 2048, kEpiQ32, nullptr, 0, U(3), U(4)}, {&L(1), P(T[5]), 2048}},
+                     F8Act{U(0), U(1), 4096}, M, ws, s);
   } else if (k == "moe.down") {  // 1022: SiTU → shared down. T: t1, xq, xs, pk
     f8_forward_out({&L(0), P(T[3]), 4096}, f8_pro(kProSitu, P(T[0]), 2048, nullptr, 0, U(1), U(2), 1024), M, ws, s);
   } else if (k == "moe.fc2") {  // 869 ffn_b: latent_norm → fc2 + shared. T: pl, lnorm, ps, xq, xs, fout
@@ -361,11 +364,13 @@ std::vector<double> site_bench(const std::string& k, const std::vector<std::vect
 }
 
 int test_seq(int c) { return e55::f8_test_seq(c); }
+int test_mid(int mt) { return e55::f8_test_mid(mt); }
 std::string path(int h, int M, int epi) { return e55::f8_test_path(g_lin.at(h), M, epi); }
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("test_seq", &test_seq);
+  m.def("test_mid", &test_mid);
   m.def("path", &path);
   m.def("vec", &vec);
   m.def("clone", &clone_w);

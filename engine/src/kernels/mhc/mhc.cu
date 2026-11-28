@@ -1,7 +1,7 @@
 // mhc.cu — mHC pre / post / head (contract and the exact arithmetic: mhc.h). Base kernels: one CTA of 256 threads per
 // row; P050 mhc_dec (p050_mhc_dec.cuh; P107 mhc_rows_pdl there), P051 mhc_big (p051_mhc_big.cuh), P072 mhc_fuse
 // (p072_mhc_fuse.cuh), P106 mhc_prefill (p106_mhc_prefill.cuh, post + pre only) and P164 mhc_verify
-// (p164_mhc_verify.cuh, M ≤ 32) compute the same values faster.
+// (p164_mhc_verify.cuh, M ≤ 32; P192 mhc_verify64 p192_mhc_verify64.cuh, 33 … 64) compute the same values faster.
 #include "kernels/mhc/mhc.h"
 
 #include <cmath>
@@ -367,6 +367,7 @@ void base(const MhcW& m, const float* w, bf16* R, const bf16* out, int M, float*
 #include "kernels/mhc/p072_mhc_fuse.cuh"  // P072 mhc_fuse (M > 16, one launch)
 #include "kernels/mhc/p106_mhc_prefill.cuh"  // P106 mhc_prefill (post + pre, M >= 256)
 #include "kernels/mhc/p164_mhc_verify.cuh"  // P164 mhc_verify (M <= 32)
+#include "kernels/mhc/p192_mhc_verify64.cuh"  // P192 mhc_verify64 (33 <= M <= 64, with P164)
 
 void init_kernels() {  // shared-memory opt-ins, once, at upload (not inside a later graph capture)
   static const bool done = [] {
@@ -387,6 +388,8 @@ void run(const MhcW& m, bf16* R, const bf16* out, int M, float* mix, float* post
   const float* w = MODE == 2 ? m.fnb : m.fnq;
   if (!w) qlog::fail("mhc", "broadcast pre on a mixer without fn_b (only layer 0's attention mixer has one)");
   if (M <= p164::kMaxM && patch::on(patch::mhc_verify)) return p164::run<MODE>(m, w, R, out, M, post, comb, inp, s);  // P164
+  if (M <= p192::kMaxM && patch::on(patch::mhc_verify) && patch::on(patch::mhc_verify64))
+    return p192::run<MODE>(m, w, R, out, M, post, comb, inp, s);  // P192
   if (M <= kDecM && patch::on(patch::mhc_dec)) return p050::run<MODE>(m, w, R, out, M, post, comb, inp, s);  // P050
   if constexpr (MODE == 1)
     if (M >= p106::kMinM && patch::on(patch::mhc_prefill)) return p106::run(m, w, R, out, M, post, comb, inp, s);  // P106

@@ -223,7 +223,7 @@ sched = Scheduler(m, chat.eos, sv["slots"], sv["context"], sv["chunk"], think_en
                   loop_guard=S["thinking"]["loop_guard"], block=BLOCK, gate=dc["gate"], kv=kv, verify=dc["verify"],
                   checkpoints=sv["checkpoints"], checkpoint_every=sv["checkpoint_every"],
                   prefill_marks=bool(sv["prefill_marks"]), copy=COPY and eng.patch_on("copy_draft"),
-                  copy_rows=dc["copy_rows"], copy_match=dc["copy_match"])
+                  copy_rows=dc["copy_rows"], copy_match=dc["copy_match"], decode_chunk=sv["decode_chunk"])
 front.app = build(chat, sched, sv["served_name"], kv.max_tokens(), S["thinking"], int(sv["max_tokens"]))
 d = chat.defaults
 pool = (f"KV pool {kv.total * 2 / 1024:.1f} GiB · ≤ {kv.max_tokens():,} tokens a request" if kv.pool else

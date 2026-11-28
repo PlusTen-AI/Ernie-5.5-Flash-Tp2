@@ -53,8 +53,8 @@ struct MoeScratch {
   int* pfl = nullptr;                                                   // P065: [pairs] row·10 + slot of a pair
   float* run = nullptr;                                                 // P065: [rows][2048] running combine sums
   uint32_t* cst = nullptr;                                              // P065: [rows][8][4] chain states (zero)
-  int* dcnt = nullptr;                                                  // P066: ticket / done counters (zero)
-  uint8_t* dlat = nullptr;                                              // P066: the latent as MXFP8 (≤ 32 rows)
+  int* dcnt = nullptr;                                                  // P066 / P190 / P194: ticket / done counters (zero, 8 KB)
+  uint8_t* dlat = nullptr;                                              // P066 / P190 / P194: the latent as MXFP8 (≤ 128 rows)
   int* phist = nullptr;                                                 // P065: [64 chunks][512] plan counts
 };
 
@@ -151,9 +151,9 @@ MoeScratch* moe_scratch(int max_rows) {
   CUDA_CHECK(cudaMalloc(&s->run, size_t(max_rows) * kLatent * 4));
   CUDA_CHECK(cudaMalloc(&s->cst, size_t(max_rows) * 32 * 4));
   CUDA_CHECK(cudaMemset(s->cst, 0, size_t(max_rows) * 32 * 4));
-  CUDA_CHECK(cudaMalloc(&s->dcnt, 4096));
-  CUDA_CHECK(cudaMemset(s->dcnt, 0, 4096));
-  CUDA_CHECK(cudaMalloc(&s->dlat, 32 * (kLatent + kLatent / 32) + 64));
+  CUDA_CHECK(cudaMalloc(&s->dcnt, 8192));  // P194's 1024 sub-expert counters (P066 / P190 use the first 4 KB)
+  CUDA_CHECK(cudaMemset(s->dcnt, 0, 8192));
+  CUDA_CHECK(cudaMalloc(&s->dlat, 128 * (kLatent + kLatent / 32) + 64));  // P066 ≤ 32 rows, P190 ≤ 64, P194 ≤ 128
   CUDA_CHECK(cudaMalloc(&s->phist, 64 * kExperts * 4));
   return s;
 }
@@ -508,6 +508,8 @@ void run_experts(const MoeExperts* E, MoeScratch* S, const uint8_t* xq, const ui
 #include "kernels/moe/p037_moe_prefill.cuh"  // P037 moe_prefill: pipelined 256-row expert tiles (same bits)
 #include "kernels/moe/p065_moe_combine.cuh"  // P065 moe_combine: prefill combine in the down epilogue (same bits)
 #include "kernels/moe/p066_moe_fused.cuh"    // P066 moe_fused: decode route + latent quant + experts, one launch
+#include "kernels/moe/p190_moe_fused_mid.cuh"  // P190 moe_fused64: P066's launch for 33 … 64 rows (same bits)
+#include "kernels/moe/p194_moe_fused128.cuh"  // P194 moe_fused128: P190's items for 65 … 128 rows, two row halves (same bits)
 #include "kernels/moe/p086_moe_dn.cuh"       // P086 moe_pf_dn: prefill down + combine, coalesced chains
 
 void moe_route(const float* logits, const float* bias, const float* scale, int M, int* ids, float* w, cudaStream_t s) {
@@ -566,18 +568,34 @@ void moe_test_plan(MoeScratch* S, const int* ids, int M, bool fast, cudaStream_t
   CUDA_CHECK(cudaGetLastError());
 }
 
-bool moe_fused_ok(int M) { return M >= 1 && M <= p066::kMaxM && patch::on(patch::moe_fused); }
+// P066 up to 32 rows; P190 moe_fused64 (with P066) 33 … 64 rows (DSpark verify / draft steps of 5–8 sequences);
+// P194 moe_fused128 (with P066) 65 … 128 rows (9–16 sequences)
+bool moe_fused_ok(int M) {
+  if (M < 1 || !patch::on(patch::moe_fused)) return false;
+  if (M <= p066::kMaxM) return true;
+  if (M <= p190::kMaxM) return patch::on(patch::moe_fused64);
+  return M <= p194::kMaxM && patch::on(patch::moe_fused128);
+}
+namespace {
+template <class OutT>
+void fused(const MoeExperts* E, MoeScratch* S, const float* logits, const float* bias, const float* scale,
+           const bf16* lat, int ldl, const uint8_t* lat_q, const uint8_t* lat_s, int M, int* ids, float* w, OutT* part,
+           int ld, cudaStream_t s) {
+  if (!moe_fused_ok(M) || !lat == !lat_q) qlog::fail("moe", "moe_fused: M %d", M);
+  if (M <= p066::kMaxM) return p066::run(E, S, logits, bias, scale, lat, ldl, lat_q, lat_s, M, ids, w, part, ld, s);
+  if (M <= p190::kMaxM) return p190::run(E, S, logits, bias, scale, lat, ldl, lat_q, lat_s, M, ids, w, part, ld, s);
+  p194::run(E, S, logits, bias, scale, lat, ldl, lat_q, lat_s, M, ids, w, part, ld, s);  // P194
+}
+}  // namespace
 void moe_fused(const MoeExperts* E, MoeScratch* S, const float* logits, const float* bias, const float* scale,
                const bf16* lat, int ldl, const uint8_t* lat_q, const uint8_t* lat_s, int M, int* ids, float* w,
                bf16* part, int ld, cudaStream_t s) {
-  if (!moe_fused_ok(M) || !lat == !lat_q) qlog::fail("moe", "moe_fused: M %d", M);
-  p066::run(E, S, logits, bias, scale, lat, ldl, lat_q, lat_s, M, ids, w, part, ld, s);
+  fused(E, S, logits, bias, scale, lat, ldl, lat_q, lat_s, M, ids, w, part, ld, s);
 }
 void moe_fused_f32(const MoeExperts* E, MoeScratch* S, const float* logits, const float* bias, const float* scale,
                    const bf16* lat, int ldl, const uint8_t* lat_q, const uint8_t* lat_s, int M, int* ids, float* w,
                    float* part, int ld, cudaStream_t s) {
-  if (!moe_fused_ok(M) || !lat == !lat_q) qlog::fail("moe", "moe_fused: M %d", M);
-  p066::run(E, S, logits, bias, scale, lat, ldl, lat_q, lat_s, M, ids, w, part, ld, s);
+  fused(E, S, logits, bias, scale, lat, ldl, lat_q, lat_s, M, ids, w, part, ld, s);
 }
 void moe_experts_bf16(const MoeExperts* E, MoeScratch* S, const uint8_t* lat_q, const uint8_t* lat_s, const int* ids,
                       const float* w, int M, bf16* part, int ld, cudaStream_t s) {

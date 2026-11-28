@@ -16,6 +16,8 @@
 //     compressor at 17–32 rows, 64 tiles × 2 splits: 128 one-warp CTAs for 96 slots) as two-warp CTAs (64) instead of
 //     lin_kernel's 4-warp ones (32 CTAs: 16 SMs idle).
 //   · all: the weights are requested first, the P013 row bases / exception list (dependent loads) after them.
+//   · P193 lin_small64: the same kernels (and P114's pairs) up to 64 rows (≤ 8 n8 tiles of rows, DSpark verify / draft
+//     steps of 5–8 sequences) instead of lin_kernel there — the same per-warp chains (an MMA column is one row's chain).
 //
 // Bitwise: per warp the base's work — one 16-row tile of one K split, the same shared-memory staging of weights and x
 // pieces, the same unpacking (P013) and MMAs in the same order into one fp32 accumulator; the split partials summed in
@@ -245,7 +247,7 @@ void set_smem(std::integer_sequence<int, I...>) {
   (set_smem1<FMT, I + 1, false, CK>(), ...);
 }
 void init() {
-  constexpr auto nts = std::make_integer_sequence<int, 4>{};
+  constexpr auto nts = std::make_integer_sequence<int, 8>{};  // NT 1 … 8 (P193: up to 64 rows)
   set_smem<kPack12, 4>(nts), set_smem<kPack12, 2>(nts), set_smem<WMat::BF16, 2>(nts);
   int dev = 0;
   CUDA_CHECK(cudaGetDevice(&dev));
@@ -277,10 +279,13 @@ inline int warps_of(const Lin* const* Ls, int n) {
   return 4;
 }
 
-// may these Lins (same x) run here as one launch at M rows? same format route, K, split; ≤ 32 rows; one wave of
-// lin_kernel's CTAs (2 an SM)
+// rows this kernel takes: 32, or 64 with P193 lin_small64
+inline int max_rows() { return patch::on(patch::lin_small64) ? 64 : 32; }
+
+// may these Lins (same x) run here as one launch at M rows? same format route, K, split; ≤ max_rows() rows; one wave
+// of lin_kernel's CTAs (2 an SM)
 inline bool takes(const Lin* const* Ls, int n, int M) {
-  if (M < 1 || M > 32 || n < 1 || n > kParts) return false;
+  if (M < 1 || M > max_rows() || n < 1 || n > kParts) return false;
   const int f = fmt_of(*Ls[0]);
   if (f < 0) return false;
   for (int i = 0; i < n; i++) {
@@ -318,7 +323,11 @@ void forward_parts(const Lin* const* Ls, void* const* ys, int n, const bf16* x, 
     case 1: return go(std::integral_constant<int, 1>{});
     case 2: return go(std::integral_constant<int, 2>{});
     case 3: return go(std::integral_constant<int, 3>{});
-    default: return go(std::integral_constant<int, 4>{});
+    case 4: return go(std::integral_constant<int, 4>{});
+    case 5: return go(std::integral_constant<int, 5>{});  // 33 … 64 rows: P193 lin_small64 (takes())
+    case 6: return go(std::integral_constant<int, 6>{});
+    case 7: return go(std::integral_constant<int, 7>{});
+    default: return go(std::integral_constant<int, 8>{});
   }
 }
 

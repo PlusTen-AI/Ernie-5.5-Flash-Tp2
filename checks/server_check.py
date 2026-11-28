@@ -12,7 +12,7 @@ the server.  python3 checks/server_check.py [base URL] [--only smoke,api,tools,t
             named tool that is not offered → 400 · streamed tool-call deltas · parallel_tool_calls false → one call
   thinking  ERNIE's controls: chat_template_kwargs {"enable_thinking": false} · reasoning_effort low / medium / high
             and none named · a bad effort → 400 · include_reasoning false · thinking budgets · a loop prompt
-  exact     (only when named in --only) four prompts with seeds: alone, all four at once, alone again → the same text
+  exact     (only when named in --only) four prompts greedy: alone, all four at once, alone again → the same text; seeded sampling: alone, alone again
             every time (the engine is deterministic for a seed and batch-invariant)
   reuse     (only when named in --only: phase 1 keeps no prefix cache) a five-turn conversation over a ~6K-token
             document: from the second turn on, ≥ 90% of each prompt is reused
@@ -391,22 +391,31 @@ def thinking():
 
 # ---- exact --------------------------------------------------------------------------------------------------------
 def exact():
+    """Greedy: the same text alone, all four at once and alone again (the engine's bits do not depend on the batch).
+    Sampled with a seed: the same text alone and alone again. A sampled request at once with others may draw another
+    text from the same distribution: the DSpark rounds (joint verify lengths, copy drafts only alone) depend on the
+    batch, as speculative decoding in other serving engines does — only the distribution is kept, not the sample path."""
     prompts = ["Describe a lighthouse at night in four sentences.", "List five uses of copper and explain one.",
                "Write a short dialogue between a cat and a clock.", "Explain why ice floats, step by step."]
 
-    def run(i, out):
-        out[i] = chat([{"role": "user", "content": prompts[i]}], max_tokens=160, seed=100 + i)["choices"][0]["message"]["content"]
-    alone, together, again = [None] * 4, [None] * 4, [None] * 4
-    for i in range(4):
-        run(i, alone)
-    th = [threading.Thread(target=run, args=(i, together)) for i in range(4)]
-    [t.start() for t in th]
-    [t.join() for t in th]
-    for i in range(4):
-        run(i, again)
-    same = [alone[i] == together[i] == again[i] for i in range(4)]
-    say(all(same), "exact", f"4 prompts × (alone, at once, alone again): {sum(same)}/4 identical"
-                            + ("" if all(same) else f" · differs: {[i for i in range(4) if not same[i]]}"))
+    def run(i, out, greedy):
+        kw = {"temperature": 0.0} if greedy else {"seed": 100 + i}
+        out[i] = chat([{"role": "user", "content": prompts[i]}], max_tokens=160, **kw)["choices"][0]["message"]["content"]
+    res = {}
+    for greedy in (True, False):
+        alone, together, again = [None] * 4, [None] * 4, [None] * 4
+        for i in range(4):
+            run(i, alone, greedy)
+        if greedy:
+            th = [threading.Thread(target=run, args=(i, together, True)) for i in range(4)]
+            [t.start() for t in th]
+            [t.join() for t in th]
+        for i in range(4):
+            run(i, again, greedy)
+        res[greedy] = [alone[i] == again[i] and (not greedy or alone[i] == together[i]) for i in range(4)]
+    g, s = res[True], res[False]
+    say(all(g) and all(s), "exact", f"greedy 4 prompts × (alone, at once, alone again): {sum(g)}/4 identical · "
+                                    f"seeded sampling × (alone, alone again): {sum(s)}/4 identical")
 
 
 # ---- filler text --------------------------------------------------------------------------------------------------

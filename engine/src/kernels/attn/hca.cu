@@ -328,6 +328,7 @@ __global__ void k_hca_vha_out(const bf16* __restrict__ o, const float* __restric
 #include "kernels/attn/p150_hca_attn_long.cuh"
 #include "kernels/attn/p172_hca_attn_long2.cuh"
 #include "kernels/attn/p180_hca_attn_long3.cuh"
+#include "kernels/attn/p210_hca_attn_1p.cuh"
 
 namespace e55 {
 
@@ -442,6 +443,9 @@ void hca_attn_fused(const bf16* q, const uint8_t* rows, const RowMeta* meta, Hca
                     const float* inv_freq, const float* U, int M, int max_keys, bf16* o, float* zp, float* ws,
                     size_t ws_bytes, cudaStream_t s) {
   if (M <= 0) return;
+  // P210 (prefill rule, its own order): every row of a prefill step — before any M test (a 1-row prefill chunk too)
+  if (step_prefill() && patch::on(patch::hca_attn_1p))
+    return p210::launch(q, rows, meta, c, sink, inv_freq, U, M, o, zp, s);
   if (M <= p043::kMaxM && patch::on(patch::hca_attn_dec))
     return p043::launch<true, true>(q, rows, meta, c, sink, inv_freq, U, M, max_keys, o, zp, ws, ws_bytes, s);
   const int nchk = (max_keys + kChunk - 1) / kChunk;

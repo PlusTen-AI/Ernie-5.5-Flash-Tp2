@@ -126,10 +126,15 @@ int pack12_rc() {
 }
 
 namespace {
-// P078: steps of up to this many rows read the halves (+ one all-gather per split point); larger steps the whole
-// weights (no gathers). Scratch per row for the halves: kSplitRowBytes.
-constexpr int kSplitMaxRows = 16, kSplitRowBytes = 16384;
-bool split_rows(int M) { return M <= kSplitMaxRows && patch::on(patch::tp_split); }
+// P078: steps of up to kSplit078 rows read the halves (+ one all-gather per split point); larger steps the whole
+// weights (no gathers). P191 tp_split64: up to kSplitMaxRows (verify / draft steps of 3–8 sequences) — the same views
+// and gathers on more rows, same bits. Scratch per row for the halves: kSplitRowBytes (sp_: kSplitMaxRows rows, the
+// layout strides below are by kSplitMaxRows whichever rows a step has).
+constexpr int kSplit078 = 16, kSplitMaxRows = 64, kSplitRowBytes = 16384;
+bool split_rows(int M) {
+  if (M < 1 || !patch::on(patch::tp_split)) return false;
+  return M <= kSplit078 || (M <= kSplitMaxRows && patch::on(patch::tp_split64));
+}
 // rows [o, o + n) of a [rows, w] buffer
 template <typename T>
 T* at(T* p, int o, size_t w) {
@@ -481,7 +486,7 @@ Engine::Engine(const EngineCfg& c) : c_(c) {
   aws_bytes_ = size_t(1) << 30;
   aws_ = dmalloc<float>(aws_bytes_ / 4);
   moe_ = moe_scratch(std::min(c.max_rows, kMaxCall));
-  sp_ = dmalloc<uint8_t>(size_t(kSplitMaxRows) * kSplitRowBytes);  // P078 halves
+  sp_ = dmalloc<uint8_t>(size_t(kSplitMaxRows) * kSplitRowBytes);  // P078 / P191 halves (1 MiB)
   malloc_trim(0);  // the loaders' freed host buffers back to the system (GB10: CUDA allocates from free pages)
   CUDA_CHECK(cudaDeviceSynchronize());
   size_t fr, tot;
@@ -1662,11 +1667,15 @@ void Engine::taps_copy(int layer, int M) {
 
 const float* Engine::step(const std::vector<int>& ids, const std::vector<int>& pos, const std::vector<int>& slot,
                           const std::vector<int>& seq_start, bool all_logits, const std::vector<int>& rows,
-                          bool gather) {
+                          bool gather, bool prefill) {
   if (g_sync == 2) g_t = std::chrono::steady_clock::now();
   const int M = int(ids.size()), B = int(slot.size());
   if (M < 1 || M > c_.max_rows || int(pos.size()) != M || int(seq_start.size()) != B + 1 || seq_start[B] != M)
     qlog::fail("step", "bad step shape (M %d, B %d)", M, B);
+  if (prefill && verify_) qlog::fail("step", "a verify step is a decode step (prefill = true)");
+  // the step's kind for every kernel call below (core/step_kind.h): the caller's prefill flag, never M; back to the
+  // previous kind (decode outside steps) when the step returns or throws
+  const StepKind kind(prefill);
   std::vector<RowMeta> meta(M);
   int max_hca = 0, max_pos = 0, max_dsa = 0;
   for (int b = 0; b < B; b++) {

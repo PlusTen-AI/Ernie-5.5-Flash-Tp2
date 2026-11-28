@@ -12,6 +12,11 @@ chunk, then the same chunk staged), synchronized at each end (nsys on GB10 recor
 --prefill-at P,…: one 4096-row chunk at each position, wall and staged.
 --verify N,…: at each --ctx, also an N-row step on the sequence (all logits, rewound to the same position each time:
 a DSpark verify's target step without the draft's context rows), wall and staged.
+--ab "+p,-q;+r": the --verify steps also with each patch set (switched in the process; restored after), timed the
+same way (timing only: a repeated verify-shaped step is not rewound exactly — no DSpark rollback — so its logits are
+not compared here; bits: patch_check.py --wide --w32).
+--vseqs B: the --verify steps over B sequences of N rows each (B·N rows, as a B-sequence verify; slots 0…B-1 each
+prefilled to --ctx from its own rotation of doc_long, so the rows' tokens and the expert union differ by sequence).
 --lanes L,…: the --prefill-at chunks also with E55_LANES=L (P075 lanes per part; 1 = one lane, no overlap)."""
 import argparse
 import collections
@@ -38,6 +43,11 @@ ap.add_argument("--prefill-at", default="", help="also time one 4096-row prefill
 ap.add_argument("--full", action="store_true", help="every stage line (name:line ms calls), not only the top ones")
 ap.add_argument("--rows", default="4096", help="--prefill-at chunk sizes (rows), e.g. 4096,8192,16384")
 ap.add_argument("--verify", default="", help="also N-row verify-shaped steps at each --ctx, e.g. 4,8")
+ap.add_argument("--vseqs", type=int, default=1, help="--verify steps over this many sequences of N rows each")
+ap.add_argument("--experts", action="store_true", help="after the --verify timings: dspark_init, then the verify step's "
+                "distinct routed experts a layer (the MoE union, for its byte floor)")
+ap.add_argument("--ab", default="", help="--verify also with these patch sets, ';'-separated (e.g. '+f8_mid32;-dsa_select_pf'), "
+                "timed the same way")
 ap.add_argument("--lanes", default="", help="--prefill-at chunks also with E55_LANES=L, e.g. 1,2")
 ap.add_argument("--lanes-env", default="E55_LANES", help="the variable --lanes sets (e.g. E55_A2A_AHEAD)")
 a = ap.parse_args()
@@ -55,9 +65,11 @@ PF = [int(x) for x in a.prefill_at.split(",") if x]
 ROWS = [int(x) for x in a.rows.split(",")]
 VR = [int(x) for x in a.verify.split(",") if x]
 LANES = [int(x) for x in a.lanes.split(",") if x]
-E.init(a.model, a.table, a.rank, a.head_ip, 1,
+AB = [x for x in a.ab.split(";") if x]
+VB = max(1, a.vseqs)
+E.init(a.model, a.table, a.rank, a.head_ip, VB,
        max(ctxs + [x + max(ROWS) for x in PF]) + 2 * a.steps + 8 + max(VR + [0]) + (8192 if a.nsys else 0),
-       max(ROWS + [4096]), max(VR + [1]), a.port)
+       max(ROWS + [4096]), max(VR + [1]) * VB, a.port)
 base = json.load(open(a.prompts))["doc_long"]
 
 GROUPS = [("attention", ("hca_", "dsa_", "vha_", "mul_bf16", "sigmoid")), ("FP8 GEMM", ("f8_forward", "act")),
@@ -154,31 +166,57 @@ for ctx in ctxs:
     top = sorted(rows, key=lambda x: -x[2])[:None if a.full else 14]
     say("  top: " + " · ".join(f"{n}:{ln} {ms / a.steps:.3f}" + (f"×{c // a.steps}" if a.full else "") for n, ln, ms, c in top))
     vids = (base * ((p + max(VR + [0])) // len(base) + 1))[p:p + max(VR + [0])]
+    VS = [vids]
+    for b in range(1, VB if VR else 1):  # slots 1…B-1: their own rotation of doc_long, prefilled to the same length
+        rb = base[(997 * b) % len(base):] + base[:(997 * b) % len(base)]
+        ib = (rb * ((p + max(VR)) // len(rb) + 1))[:p + max(VR)]
+        E.reset(b)
+        for c0 in range(0, p, 4096):
+            c1 = min(p, c0 + 4096)
+            E.fill(ib[c0:c1], list(range(c0, c1)), [b], [0, c1 - c0])
+        VS.append(ib[p:])
     for nv in VR:
         def vstep(k):
             for _ in range(k):
-                E.set_history(0, p)
-                E.step(vids[:nv], list(range(p, p + nv)), [0], [0, nv], True)
-        vstep(2)
-        t = time.time()
-        vstep(a.steps)
-        wall = 1e3 * (time.time() - t) / a.steps
-        E.sync_mode(2)
-        E.prof()
-        t = time.time()
-        vstep(a.steps)
-        staged = 1e3 * (time.time() - t) / a.steps
-        rows = E.prof()
-        E.sync_mode(0)
-        say(f"[prof] verify {nv} rows at {p:,}: wall {wall:.1f} ms/step · staged {staged:.1f} ms/step")
-        g = collections.Counter()
-        for name, line, ms, n in rows:
-            g[group(name)] += ms / a.steps
-        tot = sum(g.values())
-        say("  " + " · ".join(f"{k} {v:.1f} ms ({100 * v / tot:.0f}%)" for k, v in g.most_common()))
-        top = sorted(rows, key=lambda x: -x[2])[:None if a.full else 14]
-        say("  top: " + " · ".join(f"{n}:{ln} {ms / a.steps:.3f}" + (f"×{c // a.steps}" if a.full else "")
-                                   for n, ln, ms, c in top))
+                for b in range(VB):
+                    E.set_history(b, p)
+                E.step([t for v in VS for t in v[:nv]], [q for _ in range(VB) for q in range(p, p + nv)],
+                            list(range(VB)), [b * nv for b in range(VB + 1)], True)
+        for var in [""] + AB:  # the defaults, then each --ab variant (patches switched in this process)
+            for x in [x for x in var.split(",") if x]:
+                E.patch(x[1:], x[0] == "+")
+            vstep(2)
+            t = time.time()
+            vstep(a.steps)
+            wall = 1e3 * (time.time() - t) / a.steps
+            E.sync_mode(2)
+            E.prof()
+            t = time.time()
+            vstep(a.steps)
+            staged = 1e3 * (time.time() - t) / a.steps
+            rows = E.prof()
+            E.sync_mode(0)
+            say(f"[prof] verify {VB}×{nv} rows at {p:,}{' [' + var + ']' if var else ''}: wall {wall:.1f} ms/step · "
+                f"staged {staged:.1f} ms/step")
+            g = collections.Counter()
+            for name, line, ms, n in rows:
+                g[group(name)] += ms / a.steps
+            tot = sum(g.values())
+            say("  " + " · ".join(f"{k} {v:.1f} ms ({100 * v / tot:.0f}%)" for k, v in g.most_common()))
+            top = sorted(rows, key=lambda x: -x[2])[:None if a.full else 14]
+            say("  top: " + " · ".join(f"{n}:{ln} {ms / a.steps:.3f}" + (f"×{c // a.steps}" if a.full else "")
+                                       for n, ln, ms, c in top))
+            for x in [x for x in var.split(",") if x]:  # back to the defaults
+                E.patch(x[1:], x[0] != "+")
+    if a.experts and VR:  # (last: dspark_init adds the draft's context rows to every later step)
+        E.dspark_init()
+        for nv in VR:
+            E.expert_count(True)
+            vstep(2)
+            ex, n = E.expert_take()
+            u = ex[1:]
+            say(f"[prof] verify {VB}×{nv} rows: routed experts a layer (distinct, of 512) mean {sum(u) / len(u):.1f} · "
+                f"min {min(u):.0f} · max {max(u):.0f} · sum over 42 layers {sum(u):.0f}")
     E.set_history(0, p)
 
 for start, nr, lanes in [(p, r, L) for L in [0] + LANES for p in (PF if not L else PF[:1]) for r in ROWS]:

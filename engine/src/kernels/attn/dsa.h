@@ -49,6 +49,7 @@ void dsa_select(const uint8_t* qf4, const uint8_t* qs, const float* wts, const R
 // 2048 … count − 1 (the window p − 127 … p of a row with more than 2048 candidates; positions 2048 … p of one with
 // fewer) and the count. With entries 0 … 2047 from the rank that selected the row: dsa_select's list and count.
 void dsa_select_tail(const RowMeta* meta, int M, int* list, int* cnt, cudaStream_t s);
+void dsa_select_cfg(int rpc, int kr);  // tests: P046's rows a CTA (1 / 8) and keys a split forced (0, 0: its rule)
 // sparse MLA: q576 [M, 32, 576] → olat [M, 32, 512] bf16
 void dsa_attn(const bf16* q576, const int* list, const int* cnt, const RowMeta* meta, DsaCache c, const float* sink,
               int M, int max_keys, bf16* olat, float* ws, size_t ws_bytes, cudaStream_t s);

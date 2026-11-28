@@ -145,8 +145,8 @@ class Tap:
     def __getattr__(self, n):
         return getattr(E, n)
 
-    def step(self, ids, pos, slot, ss, all_logits):
-        out = E.step(ids, pos, slot, ss, all_logits)
+    def step(self, ids, pos, slot, ss, all_logits, rows=(), prefill=False):  # (prefill: the step's kind)
+        out = E.step(ids, pos, slot, ss, all_logits, list(rows), prefill)
         self.pf = out[0].clone()
         return out
 

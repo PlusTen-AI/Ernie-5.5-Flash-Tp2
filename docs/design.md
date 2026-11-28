@@ -14,8 +14,18 @@ The model's math is [model.md](model.md). This page is how the engine computes i
 | mHC mixers | fp32 | `kernels/mhc`: fp32 FMAs on CUDA cores in one fixed order (64 chunks), post fused with the next pre |
 
 Every kernel is deterministic and batch-invariant: a row's result is the same chain of operations whatever M is or
-whatever else is in the step (fixed K splits, fixed attention key chunks of 256, no float atomics). Decode, chunked
-prefill and cache reuse therefore give the same bits for the same token.
+whatever else is in the step (fixed K splits, fixed attention key chunks of 256, no float atomics). Decode steps and
+speculative rounds therefore give the same bits for the same token, and so do chunked prefill and cache reuse.
+
+**Step kind and the prefill rule.** Every step carries its kind, set by its caller (`Engine::step(…, prefill)`,
+`core/step_kind.h`): a prompt chunk is prefill; a decode step, a verify step and a draft pass are decode. Kernels choose
+by the kind, never by M alone: a 1-row prompt chunk after a checkpoint restore still takes the prefill kernels, and a
+128-row verify of 16 sequences takes the decode kernels. Since 0.6.0 a prefill kernel may accumulate in its own order
+instead of the decode kernels' (P210: HCA prefill attention as one online softmax over a row's keys in 16-key tiles,
+no 256-key chunks or merge). It keeps the reference's rounding points, determinism, batch and chunk-size invariance
+within prefill and the MoE combine's slot order, and is judged by the reference gate at the noise floor (`gate.py
+--pf`: the rule's patches off and on against the reference) instead of bitwise against decode. Decode, verify and draft
+rows keep their bits (patch_check), so speculative rounds stay plain decoding.
 
 ## TP = 2
 

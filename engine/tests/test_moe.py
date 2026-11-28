@@ -12,7 +12,11 @@
    (moe_pf_dn) against the default prefill path (P037 + P065) at M = 4096 / 8192 on layer L's real routing (the
    reference's router on real hidden states, ref v3 dumps: doc_long + en_tools + ko_short = 4575 tokens, 8192 rows
    repeat doc_long), both ranks, bf16 and fp32 outputs bitwise; ms per call (median of 12, warm: the 1.7 GB expert
-   set does not fit L2)"""
+   set does not fit L2). P190 (moe_fused64, with P066) as P066 at 33 … 64 rows: bitwise vs the base, timed on real
+   routing as 5–8 DSpark-like blocks (--only moe_fused64). P194 (moe_fused128, with P066) at 65 … 128 rows: bitwise vs
+   the base and, per row, vs P066 on the rows' 8-row pieces (each sequence's block alone); timed against today's
+   default at those M (route + act_quant + P037 / P065 / P086) on real routing as 9–16 blocks (--only moe_fused128).
+   The timed parts read the ref v3 dumps' routing (--ref-dir, default /work/results/ref/v3: en_tools, doc_long)"""
 import argparse
 import json
 import os
@@ -27,15 +31,25 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "tools", "ref"))
 import ext  # noqa: E402
 import ernie_ref as R  # noqa: E402
 
-PATCHES = ["moe_decode", "route_fast", "moe_prefill", "moe_combine", "moe_fused", "moe_pf_dn"]  # this family's patches
+PATCHES = ["moe_decode", "route_fast", "moe_prefill", "moe_combine", "moe_fused", "moe_pf_dn",
+           "moe_fused64", "moe_fused128"]  # this family's patches
 REF = {"moe_combine": ["moe_prefill"], "moe_fused": ["moe_decode", "route_fast"],  # timed against the base with these on
-       "moe_pf_dn": ["moe_prefill", "moe_combine"]}  # (bitwise against the plain base; P086 against this default)
+       "moe_pf_dn": ["moe_prefill", "moe_combine"],  # (bitwise against the plain base; P086 against this default)
+       "moe_fused64": ["moe_decode", "route_fast"],
+       "moe_fused128": ["moe_decode", "route_fast", "moe_prefill", "moe_combine", "moe_pf_dn"]}  # today's M > 64
+# P190 moe_fused64 (33 … 64 rows) runs with P066 on: the patches each one switches on (default: itself)
+WITH = {"moe_fused64": ["moe_fused", "moe_fused64"], "moe_fused128": ["moe_fused", "moe_fused128"]}
+# the fused patches' bitwise sizes and timed sizes (P066 ≤ 32, P190 33 … 64: DSpark verify of 5–8 sequences × 8 rows)
+FUSED = {"moe_fused": ((1, 2, 3, 4, 5, 8, 9, 16, 17, 24, 32), (1, 4, 8, 16, 32)),
+         "moe_fused64": ((33, 40, 47, 48, 56, 63, 64), (40, 48, 56, 64)),
+         "moe_fused128": ((65, 72, 96, 112, 127, 128), (65, 96, 112, 128))}  # 9–16 sequences × 7 / 8 rows
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", required=True)
 ap.add_argument("--table", required=True)
 ap.add_argument("--layer", type=int, default=5)
 ap.add_argument("--skip-ref", action="store_true", help="only the base-vs-patch part (4)")
 ap.add_argument("--only", default="", help="patches to compare (default: all of the family)")
+ap.add_argument("--ref-dir", default="/work/results/ref/v3", help="ref dumps with the real routing (timed parts)")
 a = ap.parse_args()
 m = ext.load("moe", ["src/kernels/moe/moe.cu", "tests/bind/moe_aq.cu", "src/core/weights.cc", "src/model/patches.cc"])
 m.open(a.model, a.table)
@@ -107,12 +121,19 @@ def real_logits(MM, i):
     if not REAL:
         from safetensors import safe_open as so
         for n in ("en_tools", "doc_long"):
-            with so(f"/work/results/ref/v3/{n}.safetensors", framework="pt", device="cpu") as f:
+            fn = os.path.join(a.ref_dir, f"{n}.safetensors")
+            if not os.path.exists(fn):
+                sys.exit(f"[moe] {fn} missing (the timed parts' real routing): copy results/ref/v3 from A, or --ref-dir")
+            with so(fn, framework="pt", device="cpu") as f:
                 REAL[n] = f.get_tensor("route")[L].long()
-    starts = [("en_tools", 100), ("doc_long", 1000), ("en_tools", 500), ("doc_long", 3000)]
+    starts = [("en_tools", 100), ("doc_long", 1000), ("en_tools", 500), ("doc_long", 3000), ("en_tools", 300),
+              ("doc_long", 1500), ("doc_long", 2000), ("doc_long", 2500),  # (8 streams: M ≤ 64)
+              ("doc_long", 100), ("en_tools", 200), ("doc_long", 400), ("en_tools", 0), ("doc_long", 700),
+              ("doc_long", 1250), ("doc_long", 1750), ("doc_long", 2250)]  # (16 streams: M ≤ 128)
     rows = []
-    for k in range(max(1, MM // 8)):
+    for k in range(max(1, -(-MM // 8))):  # (ceil: an M that is not a multiple of 8 gets its last stream cut)
         n, s0 = starts[k]
+        s0 = min(s0, REAL[n].shape[0] - 8 * 8 - 8)  # a short dump: the block's 8 shifts stay inside it
         rows.append(REAL[n][s0 + 8 * i: s0 + 8 * i + min(8, MM)])
     ids_ = torch.cat(rows)[:MM]
     lg = torch.full((MM, 1024), -6.0)
@@ -179,8 +200,13 @@ SIZES = {"moe_decode": (1, 2, 4, 8, 9), "moe_prefill": (65, 300, 4096), "moe_com
 TIMED = {"moe_decode": (1, 4, 8), "moe_prefill": (128, 4096), "moe_combine": (128, 4096)}
 for p in only:
     good = True
-    if p == "moe_fused":  # route + act_quant + experts (base, P035 / P036 on) vs one launch: ids, w, part bitwise
-        for MM in (1, 2, 3, 4, 5, 8, 9, 16, 17, 24, 32):
+    if p in FUSED:  # route + act_quant + experts (base, P035 / P036 on) vs one launch: ids, w, part bitwise
+        sizes, timed = FUSED[p]
+
+        def on():
+            for q in WITH.get(p, [p]):
+                m.set_patch(q, True)
+        for MM in sizes:
             for seed in range(3):
                 g = torch.Generator(device="cuda").manual_seed(500 + 10 * MM + seed)
                 tie = seed == 2
@@ -194,7 +220,7 @@ for p in only:
                     i0, w0 = m.route(lt, bb, scale)
                     q0, s0 = m.act_q32(lat)
                     y0, b0 = m.experts(h[r], q0, s0, i0, w0), m.experts(h[r], q0, s0, i0, w0, True)
-                    m.set_patch(p, True)
+                    on()
                     for preq in (False, True):  # the latent bf16 (quantized inside) or already MXFP8
                         i1, w1, y1 = m.fused(h[r], lt, bb, scale, lat, False, preq)
                         _, _, b1 = m.fused(h[r], lt, bb, scale, lat, True, preq)
@@ -206,7 +232,26 @@ for p in only:
                                   f"{(y0 - y1).abs().max().item():.3e})")
                             good = False
                     base()
-        for MM in (1, 4, 8, 16, 32):
+        if p == "moe_fused128":  # per row vs the decode path of one sequence: P066 on each 8-row piece alone
+            for MM in (112, 128):
+                g = torch.Generator(device="cuda").manual_seed(900 + MM)
+                lt = (torch.randn(MM, 4096, device="cuda", generator=g) * 0.3).bfloat16().float() @ wr.t()
+                lat = (torch.randn(MM, 2048, device="cuda", generator=g) * 0.5).bfloat16()
+                for r in (0, 1):
+                    base()
+                    on()
+                    for preq in (False, True):
+                        i1, w1, y1 = m.fused(h[r], lt, bias, scale, lat, False, preq)
+                        pc = [m.fused(h[r], lt[k:k + 8].contiguous(), bias, scale, lat[k:k + 8].contiguous(), False,
+                                      preq) for k in range(0, MM, 8)]
+                        same = all(torch.equal(x, torch.cat([q[j] for q in pc])) for j, x in enumerate((i1, w1, y1)))
+                        if not same:
+                            d = (y1 - torch.cat([q[2] for q in pc])).abs().max().item()
+                            print(f"    M={MM} rank {r} preq {preq}: rows differ from P066 on 8-row pieces "
+                                  f"(fp32 max diff {d:.3e})")
+                            good = False
+                    base()
+        for MM in timed:
             lg = torch.stack([real_logits(MM, i) for i in range(8)])
             lat = (torch.randn(MM, 2048, device="cuda") * 0.5).bfloat16()
             zb = torch.zeros_like(bias)
@@ -216,7 +261,7 @@ for p in only:
                 m.set_patch(rp, True)
             preq = MM <= 8  # model.cc at M ≤ 8 (P060): fc1 writes the latent's MXFP8 copy; above, act_quant runs
             t0 = m.bench_dec(h[0], lg, zb, scale, lat, 30, preq)
-            m.set_patch(p, True)
+            on()
             t1 = m.bench_dec(h[0], lg, zb, scale, lat, 30, preq)
             base()
             gbs = nexp * 3.19e6 / 1e6

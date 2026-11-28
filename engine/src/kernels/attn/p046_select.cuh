@@ -26,6 +26,15 @@
 namespace p046 {
 
 constexpr int kBins = 2048;
+// P221 dsa_sel_v32: decode / verify steps (not prefill) of 17 … 64 rows: 1024-key splits, rpc 1 up to 32 rows (a CTA
+// a row × key split), rpc 8 above — instead of P091 / rpc 8 × 4096 keys (≥ 32 rows) or rpc 1 × 512 (17–31). Measured
+// (B, cold, ~9.6K candidates, 3 / 4 / 8 sequences × 8 rows): 0.100 / 0.211 / 0.215 → 0.082 / 0.101 / 0.162 ms. The same
+// logits and lists (rows a CTA and key splits only schedule the work; integer histograms)
+constexpr int kV32Min = 17, kV32Max = 64, kV32Kr = 1024;
+int g_rpc = 0, g_kr = 0;  // tests (dsa_select_cfg): force rows a CTA (1 / 8) and keys a split (0: the rule)
+inline bool v32(int M) {
+  return e55::patch::on(e55::patch::dsa_sel_v32) && !e55::step_prefill() && M >= kV32Min && M <= kV32Max;
+}
 
 template <int RPC>
 struct Smem {
@@ -547,8 +556,9 @@ inline bool run(const uint8_t* qf4, const uint8_t* qs, const float* wts, const R
   const int ldl = std::max(64, maxc + 63) / 64 * 64;
   const int pass = int(std::min<size_t>(M, ws_bytes / ((size_t)ldl * 4)));
   if (pass < 1) qlog::fail("dsa", "indexer workspace too small");
-  const int rpc = M >= 32 ? 8 : 1;
-  const int kr = rpc == 8 ? 4096 : 512;
+  const bool v = v32(M);
+  const int rpc = g_rpc ? g_rpc : v ? (M <= 32 ? 1 : 8) : M >= 32 ? 8 : 1;
+  const int kr = g_kr ? g_kr : v ? kV32Kr : rpc == 8 ? 4096 : 512;
   const int ks_n = std::max(1, (maxc + kr - 1) / kr);
   // per-row histograms and per-group counters: zero when allocated, zeroed again by their users
   static int* hist = nullptr;

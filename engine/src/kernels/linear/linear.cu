@@ -413,7 +413,7 @@ void forward(const Lin& L, const bf16* x, void* y, int M, cudaStream_t s) {
     if (M > kDecodeRows) qlog::fail("linear", "NVFP4 weights need M ≤ %d (M %d)", kDecodeRows, M);
     return dispatch<WMat::NVFP4, F32>(L, x, y, M, s);
   }
-  if (M <= 32 && patch::on(patch::lin_small)) {  // P115: small grids as one-warp CTAs (same bits)
+  if (M <= p114::max_rows() && patch::on(patch::lin_small)) {  // P115 (P193: ≤ 64 rows): one-warp CTAs (same bits)
     const Lin* Ls[1] = {&L};
     void* ys[1] = {y};
     if (p114::takes(Ls, 1, M) && p114::warps_of(Ls, 1) < 4) return p114::forward_parts<F32>(Ls, ys, 1, x, M, s);

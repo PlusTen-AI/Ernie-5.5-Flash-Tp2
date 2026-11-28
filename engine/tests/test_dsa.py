@@ -47,6 +47,10 @@ ap.add_argument("--long", action="store_true",
                      "row·candidate of the logits work, lists + counts bitwise), dsa_attn of one 2048-row call at "
                      "131072 / 1040000 (current), and P153's correctness cases (ties, wide spreads, two slots, row "
                      "passes of a small workspace)")
+ap.add_argument("--verify", action="store_true",
+                help="P221 dsa_sel_v32 — dsa_select of verify steps (B sequences × 8 rows at ~9.6K, B = 3 / 4 / 8): "
+                     "today (P091 / P046 rpc 8 at ≥ 32 rows) vs P221 and P046's grid forced (rows a CTA × keys a "
+                     "split): lists + counts bitwise, then cold ms")
 ap.add_argument("--sizes", default="16384,131072,524288,1040000", help="--long: candidates of the first row")
 ap.add_argument("--no-peak", action="store_true")
 ap.add_argument("--no-attn", action="store_true")
@@ -329,6 +333,37 @@ if a.wide:  # session 6: P142 dsa_select_wide (every other patch at its default;
         m.patch("dsa_select_wide", True)
         print(line, flush=True)
     print("[dsa wide]", "all OK" if ok else "FAILED")
+    sys.exit(0 if ok else 1)
+
+if a.verify:  # P221 dsa_sel_v32 (every other patch at its default)
+    CFG = [("today", False, 0, 0), ("P221", True, 0, 0), ("rpc1 kr512", True, 1, 512), ("rpc1 kr1024", True, 1, 1024),
+           ("rpc8 kr512", True, 8, 512), ("rpc8 kr1024", True, 8, 1024)]
+    ok = True
+    for B in (3, 4, 8):
+        c = Case(f"verify {B}×8", [(s, 9400 + 97 * s, 8) for s in range(B)], seed=20 + B)
+        t = c.fresh()
+        st = dict(stages(c, t))
+        st["mla_rows"](), st["idx_prep"]()
+        lists, ms = {}, {}
+        for name, on, rpc, kr in CFG:
+            m.patch("dsa_sel_v32", on)
+            m.select_cfg(rpc, kr)
+            t["list"].fill_(-1), t["cnt"].zero_()
+            st["select"]()
+            torch.cuda.synchronize()
+            lists[name] = (t["list"].clone(), t["cnt"].clone())
+            if not a.no_time:
+                ms[name] = timeit(st["select"], True, a.runs)
+        m.patch("dsa_sel_v32", False)
+        m.select_cfg(0, 0)
+        same = {n: torch.equal(lists[n][0], lists["today"][0]) and torch.equal(lists[n][1], lists["today"][1])
+                for n in lists}
+        ok &= all(same.values())
+        print(f"[verify {B}×8 = {c.M} rows, ≤ {c.max_pos + 1} positions] lists + counts == today: "
+              + " · ".join(f"{n} {'OK' if v else 'DIFFER'}" for n, v in same.items()), flush=True)
+        if ms:
+            print("    dsa_select cold ms: " + " · ".join(f"{n} {v:.3f}" for n, v in ms.items()), flush=True)
+    print("[dsa verify]", "all OK" if ok else "FAILED")
     sys.exit(0 if ok else 1)
 
 if a.split:  # session 6: P140 dsa_sel_split + P141 dsa_q_own (every patch at its default)

@@ -186,9 +186,24 @@ void act_quant(const bf16* x, int ldx, int M, int k, int group, F8Act a, cudaStr
 namespace {
 #include "kernels/gemm/p060_fuse_ops.cuh"  // P060 f8_fuse_ops: device helpers, the M > 8 prep / epilogue kernels
 #include "kernels/gemm/p030_f8_decode.cuh"  // P030 f8_decode (M ≤ 32) + P032 f8_fuse_act + P060 / P064 in its kernel
+#include "kernels/gemm/p200_f8_mid.cuh"     // P200 f8_mid (33 ≤ M ≤ 128): P030's chain, 32 / 64-row token tiles
 #include "kernels/gemm/p031_f8_prefill.cuh"  // P031 f8_prefill (M > 32)
 #include "kernels/gemm/p103_f8_tile.cuh"  // P103 f8_tile (M ≥ 256) + P104 f8_tile_epi in its store
 #include "kernels/gemm/p133_f8_seq.cuh"   // P133 f8_tile_seq (M ≥ 256, K split 2 / 4: chains in one CTA)
+
+// P200: does P200 take weight L at M rows alone — patch on, the shape runs, and the measured rule (B, cold µs,
+// 2026-11-28, results/runs/2026-11-28-session1/fp8mid.md): always where today's choice is the base kernel (P031 off or
+// not taking the shape: the split-4 q / kv / fc1 / shared gate-up at ≤ 64 rows); against P031 at ≤ 64 rows where a
+// CTA's chain is long (split 1, or k / split ≥ 2048: P031 wins the split-2 chains of 512 / 1024 k), at 65 … 128 rows
+// only k / split ≥ 3072 (dense down, DSA o_proj, dense gate/up). Several weights in one call (f8_forward_multi): one
+// P200 launch where some weight takes it alone or has split 1 (HCA q_up + gate, DSA q_b + gate + iq: −6…−36 µs at 128
+// rows). Tests: p200::g_mt forces it wherever it can run.
+bool mid_takes(const F8Lin& L, int M) {
+  if (!patch::on(patch::f8_mid) || !p200::ok(L, M)) return false;
+  if (p200::g_mt || !patch::on(patch::f8_prefill) || !p031::ok(L, M)) return true;
+  const int klen = L.k / L.split;
+  return M <= 64 ? L.split == 1 || klen >= 2048 : klen >= 3072;  // (2048 at 65+: wo_a / o_proj +6…9 µs alone)
+}
 
 // P133: does P133 take weight L at M rows with activation x (patch on, the shape runs and its measured choice)?
 bool seq_takes(const F8Lin& L, int M, const F8Act& x, long gx, long gs) {
@@ -208,6 +223,7 @@ void forward(const F8Lin& L, const F8Act& x0, int M, void* y, int ldy, float* ws
     x.x = nullptr;
   }
   if (dec && p030::ok(L, M)) return p030::forward<F32>(L, x, M, y, ldy, s, gx, gs);
+  if (mid_takes(L, M)) return p200::forward<F32>(L, x, M, y, ldy, s, gx, gs);
   if (seq_takes(L, M, x, gx, gs)) return p133::forward<F32>(L, x, M, y, ldy, s, gx, gs);
   if (patch::on(patch::f8_tile) && p103::ok(L, M, x, gx, gs, ws) && p103::prefer(L, M))
     return p103::forward<F32>(L, x, M, y, ldy, ws, s, gx, gs);
@@ -369,6 +385,14 @@ void f8_forward_multi(std::initializer_list<F8Out> outs, const F8Act& a, int M, 
     if (n == 1) return Ls[0]->groups == 1 && (x.x ? p030::fuse_ok(*Ls[0], M) : p030::ok(*Ls[0], M));
     return mul && p030::multi_ok(Ls, n, x, M);
   };
+  auto p200_ok = [&](const F8Act& x) {  // P200 f8_mid: one mid-row launch for all weights (quantized activation)?
+    if (!patch::on(patch::f8_mid) || x.x || x.pro) return false;
+    if (n == 1) return Ls[0]->groups == 1 && mid_takes(*Ls[0], M);
+    if (!mul || !p200::multi_ok(Ls, n, M)) return false;
+    for (int i = 0; i < n; i++)  // one launch where some weight would take P200 alone or has split 1 (P200 ≈ P031
+      if (p200::g_mt || mid_takes(*Ls[i], M) || Ls[i]->split == 1) return true;  // alone there; the launches saved)
+    return false;
+  };
   F8Act x = a;
   if ((x.pro || aux) && !(x.x && p030_ok(x))) {  // M > 8 (or no fused decode launch): op + quantization first
     if (!x.q || !x.s || x.ld < Ls[0]->k) qlog::fail("gemm", "P060 activation op at M %d needs F8Act::q / s / ld", M);
@@ -376,10 +400,15 @@ void f8_forward_multi(std::initializer_list<F8Out> outs, const F8Act& a, int M, 
     x.x = nullptr, x.pro = 0, aux = nullptr;
   }
   bool in_store = p030_ok(x);  // epilogues in p030's store: kEpiQ32 needs the cluster path (a K split, 64-row blocks)
-  for (int i = 0; i < n; i++)
-    if ((ob[i].epi == kEpiQ32 && (Ls[i]->split < 2 || Ls[i]->n % 64)) || ob[i].epi == kEpiMulQ128) in_store = false;
+  bool in_mid = p200_ok(x);  // P200 (M ≥ 33): the same store (x.pro / aux already done by p060::prep)
+  for (int i = 0; i < n; i++) {
+    const bool q32 = ob[i].epi == kEpiQ32 && (Ls[i]->split < 2 || Ls[i]->n % 64);
+    if (q32 || ob[i].epi == kEpiMulQ128) in_store = false;
+    if (q32 || ob[i].epi == kEpiMulQ128 || ob[i].epi == kEpiSituQ128) in_mid = false;
+  }
   if (in_store && (n >= 2 || epi || x.pro || aux))
     return p030::forward_parts<false>(Ls, ys, ldys, n, x, M, s, 0, 0, epi ? ob : nullptr, aux);
+  if (in_mid && (n >= 2 || epi)) return p200::forward_parts<false>(Ls, ys, ldys, n, x, M, s, 0, 0, epi ? ob : nullptr);
   if (x.pro || aux) qlog::fail("gemm", "P060: no decode launch for the fused activation (M %d)", M);  // not reached
   // P105 f8_tile_chain: every weight on P103 / P133 with its epilogue in the store, programmatic launches, at most one
   // on P103 with a K split (the workspace; P133 needs none) — the 2nd / 3rd GEMM waits for its predecessor only after
@@ -424,6 +453,7 @@ const char* f8_test_path(const F8Lin& L, int M, int epi) {  // tests: the kernel
   d.q = reinterpret_cast<uint8_t*>(uintptr_t(256)), d.s = d.q, d.ld = L.k;
   float* ws = reinterpret_cast<float*>(uintptr_t(256));
   if (patch::on(patch::f8_decode) && p030::ok(L, M)) return "P030";
+  if (mid_takes(L, M)) return "P200";
   if (epi != kEpiNone) {
     const F8Out o{&L, nullptr, 0, epi};
     if (tile_epi(L, M, o, &d, 0, 0, ws)) return seq_takes(L, M, d, 0, 0) && p133::epi_ok(L, epi) ? "P133+epi" : "P103+epi";
@@ -436,6 +466,11 @@ const char* f8_test_path(const F8Lin& L, int M, int epi) {  // tests: the kernel
 int f8_test_seq(int c) {  // tests: P133's config for every shape (−1: the measured choice); returns the previous one
   const int o = p133::g_cfg;
   p133::g_cfg = c;
+  return o;
+}
+int f8_test_mid(int mt) {  // tests: P200's token tile 32 / 64 / 128 for every shape it can run (0: the measured rule)
+  const int o = p200::g_mt;
+  p200::g_mt = mt;
   return o;
 }
 int f8_test_pfn(int n) {  // tests: P064's prefetch depth (k32 blocks); returns the previous one

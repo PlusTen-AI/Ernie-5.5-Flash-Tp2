@@ -112,6 +112,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("idx_prep", &idx_prep);
   m.def("idx_prep_k", &idx_prep_k);
   m.def("select", &sel);
+  m.def("select_cfg", &e55::dsa_select_cfg);
   m.def("sel_tail", &sel_tail);
   m.def("attn", &attn);
   m.def("vha_gate", &vha_gate);

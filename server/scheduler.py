@@ -41,24 +41,48 @@ together, the counts with the most expected tokens (the draft's confidences) per
 get plain decoding's tokens bit for bit.
 Copy drafts (decode.copy, P168; copy_draft.py): a round with one decoding request whose reply repeats text its history
 holds verifies the tokens that followed that text there instead (engine spec_copy: up to decode.copy_rows rows, each
-drawn as plain decoding draws it) — under the same caps; rounds shared by several requests are the rounds above."""
+drawn as plain decoding draws it) — under the same caps; rounds shared by several requests are the rounds above.
+/metrics' speculative counters (vLLM's names) are the engine's running totals since serving began (spec_stats; the
+rounds of the warm-up, before the scheduler, are not in them): verified drafts (DSpark's and copies) — what the round's
+verify lengths chose (decode.verify, the cap), not what was drafted — and accepted ones; num_drafts counts the
+sequence-rounds that verified ≥ 1 draft (spec_verified after each round), as vLLM counts a request's step only when it
+had drafts (the engine's `seqs` counts every sequence of a round, also one whose verify length was 0).
+Round cost on this thread (the GPU idles meanwhile; engine/tests/sched_round.py measures it at B = 4 / 8 / 16 against a
+fake engine): one spec_round for all decoding sequences, per sequence the caps (an incremental loop guard: O(periods) a
+token, not a scan of its 256-token tail), the round's tokens into the replies. Tokens for the HTTP thread (Req.push)
+are held until just before the next long engine call (_flush), whose GIL release lets the HTTP thread do its token
+work while the GPU runs instead of between two rounds; the switch interval (GIL_SWITCH_S) bounds what a GIL handover
+can still take from this thread. While other requests decode, a prompt's chunk can be read in pieces of
+server.decode_chunk rows (each ≥ MIN_PIECE rows; every kernel is batch-invariant, so a row gets the same bits in any
+piece), so the running replies wait one piece, not a whole chunk."""
 import collections
 import queue
+import sys
+import threading
 import time
 
 import qlog
 from copy_draft import MIN_COPY, Copier
 
 LOOP_SPAN, LOOP_PERIOD = 256, 8  # loop guard: the last 256 thinking tokens repeat a pattern of ≤ 8 tokens
+GIL_SWITCH_S = 0.0005  # Python's switch interval while the scheduler runs (default 5 ms: a GIL handover to the HTTP
+                       # thread could hold the next round back that long)
+PUSH_DELAY_S = 0.0002  # the pusher starts this long after a wake-up: the engine call has released the GIL by then
+MIN_PIECE = 512        # server.decode_chunk: a prompt piece has at least this many rows (fewer read the experts for
+                       # too few rows; the bits are the same for any piece)
 CKPT_MIN = 1024  # P146: no checkpoint below this history (it would save less prefill than its chunks are worth)
 # P143 verify_joint (decode.verify = "cost"): ms of a DSpark round, measured 2026-11-25 on TP2 at context ≈ 9.4K: the
 # verify target step by sequences B and total rows R — (R, ms) points (B = 1: step_prof --verify; B = 4: sampled rounds,
 # sched_dspark.py --do cost), linear in R between them and along the end segments past them — and the rest of a round
 # (the draft's context rows, accept, commit, the next drafts at depth 7, the scheduler: start to start less the target
-# step, sampled rounds at T 1.0 / top_p 0.95, sched_dspark.py --do rate) by B. A B between two measured ones: linear.
+# step, sampled rounds at T 1.0 / top_p 0.95, sched_dspark.py --do rate) by B. A B between two measured ones: linear;
+# B = 8 and 16 measured too (2026-11-28); a B between two measured ones is linear between them.
 ROUND_VERIFY_MS = {1: ((1, 32.0), (4, 43.3), (8, 57.1)),
-                   4: ((4, 48.9), (8, 65.6), (12, 77.9), (16, 90.8), (24, 113.3), (32, 128.5))}
-ROUND_REST_MS = ((1, 5.9), (4, 11.0))
+                   4: ((4, 48.9), (8, 65.6), (12, 77.9), (16, 90.8), (24, 113.3), (32, 128.5)),
+                   # B = 8 / 16 (0.6.0, sched_dspark --do cost --cost-b 8,16 with P190–P193 + P200, ≈ 9.6K context)
+                   8: ((8, 66.3), (16, 92.3), (24, 110.2), (32, 129.3), (48, 162.3), (64, 181.7)),
+                   16: ((16, 94.8), (32, 133.3), (48, 160.4), (64, 184.2), (96, 231.0), (128, 255.8))}
+ROUND_REST_MS = ((1, 5.9), (4, 11.0), (8, 17.0), (16, 26.6))
 
 
 def looping(tail):
@@ -134,6 +158,9 @@ class Req:
         # closed the thinking (if it did)
         self.thinking, self.budget, self.n_think, self.forced = False, None, 0, None
         self.tail = collections.deque(maxlen=LOOP_SPAN)
+        # runs[p]: how many thinking tokens in a row (ending at the newest) equal the one p before them — looping() /
+        # loop_room() from these are the module functions over the tail, without scanning it
+        self.runs = [0] * (LOOP_PERIOD + 1)
         # tool_choice required / named: force = the tokens to put right after </ernie:think> (thinking on),
         # prefix_out = the same tokens already appended to the prompt, emitted first (thinking off), stop_tok = end
         # the reply after this token (named, or parallel_tool_calls false)
@@ -143,10 +170,31 @@ class Req:
         self.reuse = "reset"
         self.error = None  # why the server refused it (sent to the client)
         self.cp, self.cp_nodraft = None, False  # P168: copy state (copy_draft.State); a copy went on: no DSpark drafts
+        self.cend = None  # server.decode_chunk: the end of the prompt chunk being read in pieces
 
     @property
     def penalised(self):
         return self.pen != (1.0, 0.0, 0.0)
+
+    def think_tok(self, t):
+        """a thinking token into the loop guard's tail"""
+        tail, runs, n = self.tail, self.runs, len(self.tail)
+        for p in range(1, LOOP_PERIOD + 1):
+            runs[p] = runs[p] + 1 if p <= n and tail[-p] == t else 0
+        tail.append(t)
+
+    def looping(self):
+        """= looping(self.tail): the last LOOP_SPAN tokens are periodic with a period p ≤ LOOP_PERIOD (their
+        LOOP_SPAN − p pairs p apart all equal)"""
+        if len(self.tail) < LOOP_SPAN:
+            return False
+        r = self.runs
+        return any(r[p] >= LOOP_SPAN - p for p in range(1, LOOP_PERIOD + 1))
+
+    def loop_room(self):
+        """= loop_room(self.tail): the longest periodic suffix of the tail is p + runs[p] for its period p"""
+        n, r = len(self.tail), self.runs
+        return max(1, LOOP_SPAN - max(min(n, p + r[p]) for p in range(1, LOOP_PERIOD + 1)))
 
 
 class Slot:
@@ -172,8 +220,13 @@ class Scheduler:
 
     def __init__(self, eng, eos, slots, ctx, chunk, think_end=None, loop_guard=True, block=0, gate=0.0, kv=None,
                  checkpoints=8, checkpoint_every=8192, verify="gate", prefill_marks=False, copy=False, copy_rows=64,
-                 copy_match=8):
+                 copy_match=8, decode_chunk=0):
         self.eng, self.eos, self.ctx, self.chunk = eng, set(eos), ctx, chunk
+        # server.decode_chunk: prompt rows a prefill step reads while other requests decode (0: the whole chunk)
+        self.dchunk = max(MIN_PIECE, decode_chunk) if 0 < decode_chunk < chunk else 0
+        # (request, tokens, finish) for the HTTP thread, in order; pushed by the pusher thread while a long engine call
+        # runs (_flush), or here when the loop waits / returns
+        self._out, self._ev, self._lk, self._pusher = collections.deque(), threading.Event(), threading.Lock(), None
         self.kv = kv  # kvguard.KvGuard: pool admission and the memory watch (None: neither)
         self.think_end, self.loop_guard = think_end, loop_guard
         # DSpark: draft tokens per round (0 = plain decoding; the engine's dspark_init has run), the verify lengths
@@ -349,9 +402,20 @@ class Scheduler:
                 [r.seed for r in rs], ctrs, [r.pen[0] for r in rs], [r.pen[1] for r in rs], [r.pen[2] for r in rs])
 
     def _prefill_chunk(self, r):
+        """The next chunk of r's prompt: chunks of server.chunk rows from where it starts reading; with
+        server.decode_chunk, while other requests decode, a piece of one (MIN_PIECE ≤ rows, the chunk's rest ≥
+        MIN_PIECE) — checkpoints only at a chunk's end, so the same ones as reading it whole"""
         s, P = r.slot, r.prompt
-        c0, c1 = r.pf, min(len(P), r.pf + self.chunk)
+        c0 = r.pf
+        if r.cend is None or r.cend <= c0:
+            r.cend = min(len(P), c0 + self.chunk)
+        c1 = r.cend
+        if self.dchunk and c1 - c0 > self.dchunk and any(x.state in ("decode", "inject") for x in self.running):
+            c1 = c0 + self.dchunk
+            if r.cend - c1 < MIN_PIECE:
+                c1 = r.cend
         n = c1 - c0
+        self._flush()
         if c1 < len(P):
             self.eng.fill(P[c0:c1], list(range(c0, c1)), [s.i], [0, n])
             if self.marks:  # this chunk finished (rank 0's GPU only; the steps are in lockstep), then its time
@@ -361,14 +425,15 @@ class Scheduler:
             r.pf = c1
             if self.copy:
                 self._copy_sync(s)
-            if self.ck_n and c1 - max((p for p, _ in s.ck.values()), default=0) >= self.ck_every:
+            if self.ck_n and c1 == r.cend and c1 - max((p for p, _ in s.ck.values()), default=0) >= self.ck_every:
                 self._ck_take(s)  # P146: every checkpoint_every prefill tokens
             return
         if self.block:  # DSpark: a plain step (its logits row gathered), the first token from it, the first drafts
-            self.eng.step(P[c0:c1], list(range(c0, c1)), [s.i], [0, n], False)
+            # (rows = [], prefill = True: the step's kind, engine core/step_kind.h — a prompt chunk; fill() always is)
+            self.eng.step(P[c0:c1], list(range(c0, c1)), [s.i], [0, n], False, [], True)
             t = self._begin(r, len(P))
         else:
-            t = self.eng.run(P[c0:c1], list(range(c0, c1)), [s.i], [0, n], *self._args([r], [len(P)]))[0]
+            t = self.eng.run(P[c0:c1], list(range(c0, c1)), [s.i], [0, n], *self._args([r], [len(P)]), True)[0]
         s.hist += P[c0:c1]
         r.pf = c1
         if self.copy:
@@ -391,6 +456,7 @@ class Scheduler:
             x[2] += 1e3 * (t0 - self._prev[1])
             x[3] += 1
         pos = [len(r.slot.hist) for r in rs]
+        self._flush()
         toks = self.eng.run([r.last for r in rs], pos, [r.slot.i for r in rs], list(range(B + 1)),
                             *self._args(rs, [p + 1 for p in pos]))
         x = self.rstats.setdefault(B, [0, 0.0, 0.0, 0])
@@ -408,9 +474,9 @@ class Scheduler:
                 r.thinking = False
             else:
                 r.n_think += 1
-                r.tail.append(t)
+                r.think_tok(t)
                 why = ("budget" if r.budget is not None and r.n_think >= r.budget else
-                       "loop" if self.loop_guard and looping(r.tail) else None)
+                       "loop" if self.loop_guard and r.looping() else None)
                 if why and t not in self.eos:
                     t, r.thinking, r.forced = self.think_end, False, why
         return t
@@ -463,7 +529,7 @@ class Scheduler:
             if r.budget is not None:
                 cap = min(cap, max(1, r.budget - r.n_think))
             if self.loop_guard:
-                cap = min(cap, loop_room(r.tail))
+                cap = min(cap, r.loop_room())
         end = self.think_end if r.force and r.thinking else None
         for i, d in enumerate((self.peek.spec_drafts(r.slot.i) if drafts is None else drafts)[:cap - 1]):
             if d in self.eos or d == r.stop_tok or d == end:
@@ -493,6 +559,7 @@ class Scheduler:
         pos = [len(r.slot.hist) for r in rs]  # the last tokens' positions; after the round ≤ pos + cap
         room = all(p + c + self.block <= self.ctx for p, c in zip(pos, caps))
         slots = [r.slot.i for r in rs]
+        self._flush()
         outs = self.eng.spec_round(slots, room, caps)
         if not room:  # near a slot's end: the next drafts only as deep as the context lets them
             for r, p, toks in zip(rs, pos, outs):
@@ -516,11 +583,14 @@ class Scheduler:
         self.copy.c["chunk"] += 1
 
     def _spec_count(self):
-        """/metrics' speculative-decoding counters (vLLM's names): the engine's running totals of sequence-rounds,
-        verified drafts (DSpark's and copy drafts) and accepted ones — a local read, nothing goes over the link."""
+        """/metrics' speculative-decoding counters (vLLM's names), after a round — local reads, nothing goes over the
+        link: the sequence-rounds that verified ≥ 1 draft (the round's spec_verified; the engine's `seqs` also counts
+        the ones whose verify length was 0), the engine's running totals of verified drafts (DSpark's and copy drafts:
+        what the verify lengths chose) and accepted ones."""
+        self.stats["drafts"] += sum(1 for k in self.peek.spec_verified() if k > 0)
         st = self.peek.spec_stats(False)
-        self.stats["drafts"], self.stats["draft_tokens"], self.stats["accepted"] = (
-            int(st[k] - self._spec0[k]) for k in ("seqs", "verified", "accepted"))
+        self.stats["draft_tokens"], self.stats["accepted"] = (
+            int(st[k] - self._spec0[k]) for k in ("verified", "accepted"))
 
     def _copy_round(self, r, t0):
         """P168: r decodes alone — when its reply repeats its history (copy_draft.Copier), one round verifying the
@@ -544,6 +614,7 @@ class Scheduler:
         # engine makes no DSpark drafts); not at the cap (the server may end the reply or change that token there)
         follow = prop[k] if k + 1 < cap else -1
         room = p + k + 1 + self.block <= self.ctx  # (else the next drafts only as deep as the context lets them)
+        self._flush()
         toks = self.eng.spec_copy(r.slot.i, prop[:k], cap, follow, room)
         go = follow >= 0 and len(toks) == k + 1 and toks[-1] == follow
         if not room and not go:
@@ -567,11 +638,12 @@ class Scheduler:
         DSpark: [last] + T in one step, whose last row gives the token after T (as the first token of a prompt)."""
         s, T = r.slot, r.inj
         p = len(s.hist)
+        self._flush()
         if self.block:
             ids = [r.last] + T
             if r.penalised:  # a spec sequence's last token is counted with its round: here, with the forced ones
                 self.eng.pen_add(s.i, ids)
-            self.eng.step(ids, list(range(p, p + len(ids))), [s.i], [0, len(ids)], False)
+            self.eng.step(ids, list(range(p, p + len(ids))), [s.i], [0, len(ids)], False, [], True)  # (prefill kind)
             s.hist += ids
             t = self._begin(r, p + len(ids))
             r.state, r.inj = "decode", None
@@ -607,9 +679,55 @@ class Scheduler:
             if r.n_out >= r.max_tokens:
                 fin = "length"
                 break
-        r.push(out, fin)
+        self._push(r, out, fin)
         if fin:
             self._finish(r, fin)
+
+    def _push(self, r, toks, fin):
+        """tokens / the finish for r's HTTP side, pushed (in order) by the next _flush"""
+        self._out.append((r, toks, fin))
+
+    def _flush(self, now=False):
+        """The held pushes out: right before a long engine call the pusher thread is woken — it pushes while the
+        engine runs (GIL released), so neither its pushes (each wakes the HTTP loop: a GIL release) nor the HTTP
+        thread's token work fall between two rounds; now (the loop waits / returns, or no pusher): here."""
+        if not self._out:
+            return
+        if now or self._pusher is None:
+            with self._lk:
+                self._drain()
+        else:
+            self._ev.set()
+
+    def _drain(self):
+        out = self._out
+        while out:
+            r, t, f = out.popleft()
+            try:
+                r.push(t, f)
+            except Exception as e:  # (the HTTP loop is gone: shutting down)
+                qlog.warn("req", f"#{r.id}: tokens not delivered ({e})", key="push")
+
+    def _pushes(self):
+        """the pusher thread"""
+        while True:
+            self._ev.wait()
+            self._ev.clear()
+            if self._pusher is None:
+                return
+            time.sleep(PUSH_DELAY_S)
+            with self._lk:
+                self._drain()
+
+    def _pusher_on(self, on):
+        if on and self._pusher is None:
+            self._pusher = threading.Thread(target=self._pushes, daemon=True, name="push")
+            self._pusher.start()
+        elif not on and self._pusher is not None:
+            t, self._pusher = self._pusher, None
+            self._ev.set()
+            t.join()
+            self._flush(True)
 
     def _finish(self, r, why):
         r.state = "done"
@@ -638,11 +756,24 @@ class Scheduler:
     # ---- loop ------------------------------------------------------------------------------------------------
     def run(self):
         """The engine loop. Returns after drain() once no request is left (or the deadline cut them)."""
+        sys.setswitchinterval(GIL_SWITCH_S)
+        self._pusher_on(True)
+        try:
+            self._loop()
+        finally:
+            self._pusher_on(False)
+
+    def _loop(self):
         while True:
             try:
-                block = not (self.waiting or self.running or self.draining)
+                # idle (nothing runs — requests waiting for memory too): wait for a request, the memory watch's
+                # next read or a drain; else take what came without waiting
+                block = not (self.running or self.draining)
+                if block:
+                    self._flush(True)
                 while True:  # (kvguard: idle, the loop still wakes for the memory watch)
-                    r = self.inbox.get(block=block, timeout=self.kv.poll_s if block and self.kv is not None else None)
+                    r = self.inbox.get(block=block, timeout=self.kv.poll_s if block and self.kv is not None else
+                                       (0.05 if block and self.waiting else None))
                     if r is not None:  # None: a wake-up (drain)
                         self.waiting.append(r)
                     block = False
@@ -657,9 +788,9 @@ class Scheduler:
                 if r in self.waiting:
                     self.waiting.remove(r)
                     r.state = "done"
-                    r.push([], "abort")
+                    self._push(r, [], "abort")
                 else:
-                    r.push([], "abort")
+                    self._push(r, [], "abort")
                     self._finish(r, "abort")
             if self.draining and not (self.waiting or self.running):
                 return

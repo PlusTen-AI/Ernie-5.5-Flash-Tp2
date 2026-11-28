@@ -43,7 +43,9 @@ void moe_experts_bf16(const MoeExperts* e, MoeScratch* sc, const uint8_t* lat_q,
 // P066 moe_fused (decode / verify, M ≤ 32): moe_route + (the latent's MXFP8 act_quant) + moe_experts_bf16 as one
 // launch, same bits — logits fp32 [M, 1024]; the latent either bf16 lat [M, ldl] (quantized inside, act_quant's
 // arithmetic; lat_q = lat_s = null) or already MXFP8 lat_q [M, 2048] / lat_s [M, 64] (lat = null); ids / w as
-// moe_route writes them. moe_fused_ok(M): the patch is on and M fits (otherwise call moe_route / act_quant /
+// moe_route writes them. P190 moe_fused64 (with P066): the same launch for 33 … 64 rows, same bits.
+// P194 moe_fused128 (with P066): the same items for 65 … 128 rows (two 64-row halves), same bits.
+// moe_fused_ok(M): the patch is on and M fits (otherwise call moe_route / act_quant /
 // moe_experts_bf16).
 bool moe_fused_ok(int M);
 void moe_fused(const MoeExperts* e, MoeScratch* sc, const float* logits, const float* bias, const float* scale,

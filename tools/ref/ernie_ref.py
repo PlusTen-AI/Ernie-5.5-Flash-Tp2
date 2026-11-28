@@ -8,6 +8,8 @@ W4A8 experts (activations MXFP8), FP8 KV rows (HCA: UE8M0 per 64 + bf16 rope; DS
 MXFP4 indexer. Attention is computed densely with masks (the same keys the sparse kernels gather).
 
   python3 tools/ref/ernie_ref.py --model <ckpt> --prompts <prompts.json> --out <dir> [--names a,b] [--layers N]
+Long prompts (the gate's "long", ~139K tokens): --qchunk 64 --rows 16384 --key-slice (memory / time; see hca()), and
+the saved positions thin out by themselves (sel_positions). Without the three flags the dumps are bit for bit as before.
 
 Writes <out>/<name>.safetensors per prompt:
   ids [T] · pos_sel [P] (positions with saved states) · resid [L, P, 4, H] bf16 (residual after each layer) ·
@@ -289,14 +291,20 @@ def mhc_pre(R, w, kind, normw, x=None):
     return post, comb, inp
 
 
-def mhc_post(out, R, post, comb):
+def mhc_post(out, R, post, comb, rows=16384):
     """R'_j = Σ_i comb[i][j]·R_i + post_j·out as vLLM-ERNIE's fused kernel: post·out first, then the four terms in
     order as FMAs (fp64 stands in for fma's single rounding). Returns (R' bf16, the unrounded fp32 sum for the next
-    pre)."""
-    r = post[..., None] * out.float()[:, None, :]
-    for i in range(HC):
-        r = (r.double() + comb[:, i, :, None].double() * R[:, i].double()[:, None, :]).float()
-    return bf(r), r
+    pre). Elementwise, so done in blocks of rows (the same bits; the fp64 temporaries of a 139K prompt took ~70 GB)."""
+    T = R.shape[0]
+    Ro = torch.empty(R.shape, dtype=BF, device=R.device)
+    ro = torch.empty(R.shape, dtype=F32, device=R.device)
+    for a in range(0, T, rows):
+        b = min(T, a + rows)
+        r = post[a:b, :, None] * out[a:b].float()[:, None, :]
+        for i in range(HC):
+            r = (r.double() + comb[a:b, i, :, None].double() * R[a:b, i].double()[:, None, :]).float()
+        Ro[a:b], ro[a:b] = bf(r), r
+    return Ro, ro
 
 
 def vha(o, w):
@@ -312,13 +320,15 @@ def softmax_sink(s, sink):
     return e / (e.sum(-1) + torch.exp(sink - m))[..., None]
 
 
-def hca(x, w, pos, cs, qchunk=256):
+def hca(x, w, pos, cs, qchunk=256, rows=0, kslice=False):
+    """rows: the query side (q prep, attention, VHA, wo_a, gate, o_proj) in blocks of this many rows (0: all rows at
+    once) — the same per-row math, its GEMMs on fewer rows (their fp32 sums may change with the shape); kslice: each
+    query chunk [a, b) scores only the keys its mask can open (window rows [a − 127, b), compressed entries < b / 128)
+    instead of all T + G — the same keys, the masked ones' exact zeros left out of the fp32 sums. Both are for long
+    prompts (positions assumed 0 … T − 1, as run() gives); with neither, the arithmetic is the original's."""
     T = x.shape[0]
     qr = rms(lin8(x, w.lin("self_attn.linear_q_down_proj")), w("self_attn.q_layernorm.weight"))
     kv = rms(lin8(x, w.lin("self_attn.linear_kv_proj")), w("self_attn.kv_layernorm.weight"))
-    q = lin8(qr, w.lin("self_attn.linear_q_up_proj")).view(T, 64, 512).float()
-    q = q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + EPS)
-    q = bf(torch.cat([q[..., :448], rope_gptj(q[..., 448:], cs)], -1))
     kvr = kv.float()
     kvr = torch.cat([kvr[:, :448], rope_gptj(kvr[:, 448:], cs)], -1)
     win = kv_row_v4(kvr)  # [T, 512] fp32 (bf16-exact values)
@@ -337,81 +347,113 @@ def hca(x, w, pos, cs, qchunk=256):
         comp = kv_row_v4(torch.cat([cn[:, :448], rope_gptj(cn[:, 448:], ccs)], -1))
     keys = torch.cat([win, comp], 0)  # [T + G, 512]
     sink = w("self_attn.core_attention.attn_sink", F32)
-    o = torch.empty(T, 64, 512, device=DEV, dtype=BF)
     kidx = torch.arange(T + G, device=DEV)
-    for a in range(0, T, qchunk):
-        b = min(T, a + qchunk)
-        p = pos[a:b, None]
-        is_win = kidx[None, :] < T
-        ok_win = is_win & (kidx[None, :] <= p) & (kidx[None, :] >= p - 127)
-        ok_cmp = (~is_win) & ((kidx[None, :] - T) < (p + 1) // 128)
-        mask = ok_win | ok_cmp  # [tc, K]
-        s = torch.einsum("thd,kd->thk", q[a:b].float(), keys) * (512 ** -0.5)
-        s = s.masked_fill(~mask[:, None, :], float("-inf"))
-        pr = softmax_sink(s, sink)
-        o[a:b] = bf(torch.einsum("thk,kd->thd", pr, keys))
-    o2 = vha(o, w).float()
-    o2 = torch.cat([o2[..., :448], rope_gptj(o2[..., 448:], cs, inverse=True)], -1)
-    oq = act_q8(o2.reshape(T, 64 * 512))
-    wa = w.lin("self_attn.linear_o_group_proj").view(8, 1024, 4096)
-    z = bf(torch.einsum("tgk,grk->tgr", oq.view(T, 8, 4096), wa)).reshape(T, 8192)
-    gate = bf(torch.sigmoid(lin8(qr, w.lin("self_attn.gate_proj")).float()))
-    return lin8(bf(z.float() * gate.float()), w.lin("self_attn.o_proj")), None
+    outs = []
+    for r0 in range(0, T, rows or T):
+        r1 = min(T, r0 + (rows or T))
+        n, csr = r1 - r0, (cs[0][r0:r1], cs[1][r0:r1])
+        q = lin8(qr[r0:r1], w.lin("self_attn.linear_q_up_proj")).view(n, 64, 512).float()
+        q = q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + EPS)
+        q = bf(torch.cat([q[..., :448], rope_gptj(q[..., 448:], csr)], -1))
+        o = torch.empty(n, 64, 512, device=DEV, dtype=BF)
+        for a in range(r0, r1, qchunk):
+            b = min(r1, a + qchunk)
+            p = pos[a:b, None]
+            ki, kk = kidx, keys
+            if kslice:
+                ki = torch.cat([torch.arange(max(0, a - 127), b, device=DEV),
+                                T + torch.arange(min(G, b // 128), device=DEV)])
+                kk = keys[ki]
+            is_win = ki[None, :] < T
+            ok_win = is_win & (ki[None, :] <= p) & (ki[None, :] >= p - 127)
+            ok_cmp = (~is_win) & ((ki[None, :] - T) < (p + 1) // 128)
+            mask = ok_win | ok_cmp  # [tc, K]
+            s = torch.einsum("thd,kd->thk", q[a - r0:b - r0].float(), kk) * (512 ** -0.5)
+            s = s.masked_fill(~mask[:, None, :], float("-inf"))
+            pr = softmax_sink(s, sink)
+            o[a - r0:b - r0] = bf(torch.einsum("thk,kd->thd", pr, kk))
+            del s, pr
+        o2 = vha(o, w).float()
+        del o, q
+        o2 = torch.cat([o2[..., :448], rope_gptj(o2[..., 448:], csr, inverse=True)], -1)
+        oq = act_q8(o2.reshape(n, 64 * 512))
+        del o2
+        wa = w.lin("self_attn.linear_o_group_proj").view(8, 1024, 4096)
+        z = bf(torch.einsum("tgk,grk->tgr", oq.view(n, 8, 4096), wa)).reshape(n, 8192)
+        gate = bf(torch.sigmoid(lin8(qr[r0:r1], w.lin("self_attn.gate_proj")).float()))
+        outs.append(lin8(bf(z.float() * gate.float()), w.lin("self_attn.o_proj")))
+    return (outs[0] if len(outs) == 1 else torch.cat(outs)), None
 
 
-def dsa(x, w, pos, cs8, csn, qchunk=256):
+def dsa(x, w, pos, cs8, csn, qchunk=256, rows=0, kslice=False):
+    """rows / kslice as hca(): the query side in blocks of rows; each query chunk [a, b) against keys [0, b) only
+    (the indexer's candidates and the window end before b) instead of all T."""
     T = x.shape[0]
     qc = rms(lin8(x, w.lin("self_attn.q_a_proj")), w("self_attn.q_a_layernorm.weight"))
     kvl = lin8(x, w.lin("self_attn.kv_a_proj_with_mqa"))
     kvc = rms(kvl[:, :512], w("self_attn.kv_a_layernorm.weight"))
     kpe = bf(rope_gptj(kvl[:, 512:].float(), cs8))
-    gate = bf(torch.sigmoid(lin8(qc, w.lin("self_attn.gate_proj")).float()))
-    q = lin8(qc, w.lin("self_attn.q_b_proj")).view(T, 64, 256)
-    qpe = bf(rope_gptj(q[..., 192:].float(), cs8))
-    # indexer
+    # indexer keys
     ip = "self_attn.core_attention.indexer."
-    qi = lin8(qc, w.lin(ip + "wq_b")).view(T, 64, 128).float()
     kw = bf(x.float() @ torch.cat([w(ip + "wk.weight", F32), w(ip + "weights_proj.weight", F32)], 0).t())
     k = bf(torch.nn.functional.layer_norm(kw[:, :128].float(), (128,), w(ip + "k_norm.weight", F32),
                                           w(ip + "k_norm.bias", F32), 1e-6))
     wts = kw[:, 128:].float() * (128 ** -0.5 * 64 ** -0.5)
-    qi = bf(torch.cat([rope_neox(qi[..., :64], csn), qi[..., 64:]], -1))
     kf = k.float()
     k = bf(torch.cat([rope_neox(kf[:, :64], csn), kf[:, 64:]], -1))
-    qi4, k4 = mxfp4_q(hadamard128(qi).float()), mxfp4_q(hadamard128(k).float())
+    k4 = mxfp4_q(hadamard128(k).float())
     # MLA
     kvb = w.lin("self_attn.kv_b_proj").view(64, 448, 512)
     wuk, wuv = bf(kvb[:, :192]).float(), bf(kvb[:, 192:]).float()
-    qlat = bf(torch.einsum("thn,hnc->thc", q[..., :192].float(), wuk))
     kc = kv_row_mla(kvc)  # [T, 512] fp32
     sink = w("self_attn.core_attention.softmax_offset", F32)
-    o = torch.empty(T, 64, 256, device=DEV, dtype=BF)
     topk_all = torch.full((T, 2048), -1, dtype=torch.int32, device=DEV)
     tk = torch.arange(T, device=DEV)
-    for a in range(0, T, qchunk):
-        b = min(T, a + qchunk)
-        p = pos[a:b, None]
-        lg = (torch.relu(torch.einsum("thd,kd->thk", qi4[a:b], k4)) * wts[a:b, :, None]).sum(1)  # [tc, T]
-        cand = tk[None, :] <= p - 128
-        lg = lg.masked_fill(~cand, float("-inf"))
-        n = cand.sum(-1)
-        kk = min(2048, T)
-        top = lg.topk(kk, -1).indices
-        valid = torch.arange(kk, device=DEV)[None, :] < n[:, None].clamp(max=2048)
-        # invalid picks go to a spare column T (dropped): pointing them at 0 let their False overwrite position 0
-        sel = torch.zeros(b - a, T + 1, dtype=torch.bool, device=DEV)
-        sel.scatter_(1, torch.where(valid, top, torch.full_like(top, T)), True)
-        sel = sel[:, :T] | ((tk[None, :] <= p) & (tk[None, :] >= p - 127))
-        tsel = torch.where(valid, top, torch.full_like(top, -1)).sort(-1, descending=True).values[:, :2048]
-        topk_all[a:b, :tsel.shape[1]] = tsel.int()
-        s = (torch.einsum("thc,kc->thk", qlat[a:b].float(), kc) +
-             torch.einsum("thr,kr->thk", qpe[a:b].float(), kpe.float())) * (256 ** -0.5)
-        s = s.masked_fill(~sel[:, None, :], float("-inf"))
-        pr = softmax_sink(s, sink)
-        olat = bf(torch.einsum("thk,kc->thc", pr, kc))
-        o[a:b] = bf(torch.einsum("thc,hvc->thv", olat.float(), wuv))
-    o2 = vha(o, w)
-    return lin8(bf(o2.reshape(T, 64 * 256).float() * gate.float()), w.lin("self_attn.o_proj")), topk_all
+    outs = []
+    for r0 in range(0, T, rows or T):
+        r1 = min(T, r0 + (rows or T))
+        n = r1 - r0
+        c8, cn = (cs8[0][r0:r1], cs8[1][r0:r1]), (csn[0][r0:r1], csn[1][r0:r1])
+        gate = bf(torch.sigmoid(lin8(qc[r0:r1], w.lin("self_attn.gate_proj")).float()))
+        q = lin8(qc[r0:r1], w.lin("self_attn.q_b_proj")).view(n, 64, 256)
+        qpe = bf(rope_gptj(q[..., 192:].float(), c8))
+        qi = lin8(qc[r0:r1], w.lin(ip + "wq_b")).view(n, 64, 128).float()
+        qi = bf(torch.cat([rope_neox(qi[..., :64], cn), qi[..., 64:]], -1))
+        qi4 = mxfp4_q(hadamard128(qi).float())
+        qlat = bf(torch.einsum("thn,hnc->thc", q[..., :192].float(), wuk))
+        del q, qi
+        o = torch.empty(n, 64, 256, device=DEV, dtype=BF)
+        for a in range(r0, r1, qchunk):
+            b = min(r1, a + qchunk)
+            p = pos[a:b, None]
+            kb = b if kslice else T  # keys [0, kb)
+            tkb = tk[None, :kb]
+            lg = (torch.relu(torch.einsum("thd,kd->thk", qi4[a - r0:b - r0], k4[:kb])) *
+                  wts[a:b, :, None]).sum(1)  # [tc, kb]
+            cand = tkb <= p - 128
+            lg = lg.masked_fill(~cand, float("-inf"))
+            m = cand.sum(-1)
+            kk = min(2048, kb)
+            top = lg.topk(kk, -1).indices
+            valid = torch.arange(kk, device=DEV)[None, :] < m[:, None].clamp(max=2048)
+            # invalid picks go to a spare column kb (dropped): pointing them at 0 let their False overwrite position 0
+            sel = torch.zeros(b - a, kb + 1, dtype=torch.bool, device=DEV)
+            sel.scatter_(1, torch.where(valid, top, torch.full_like(top, kb)), True)
+            sel = sel[:, :kb] | ((tkb <= p) & (tkb >= p - 127))
+            tsel = torch.where(valid, top, torch.full_like(top, -1)).sort(-1, descending=True).values[:, :2048]
+            topk_all[a:b, :tsel.shape[1]] = tsel.int()
+            del lg
+            s = (torch.einsum("thc,kc->thk", qlat[a - r0:b - r0].float(), kc[:kb]) +
+                 torch.einsum("thr,kr->thk", qpe[a - r0:b - r0].float(), kpe[:kb].float())) * (256 ** -0.5)
+            s = s.masked_fill(~sel[:, None, :], float("-inf"))
+            pr = softmax_sink(s, sink)
+            olat = bf(torch.einsum("thk,kc->thc", pr, kc[:kb]))
+            o[a - r0:b - r0] = bf(torch.einsum("thc,hvc->thv", olat.float(), wuv))
+            del s, pr
+        o2 = vha(o, w)
+        del o
+        outs.append(lin8(bf(o2.reshape(n, 64 * 256).float() * gate.float()), w.lin("self_attn.o_proj")))
+    return (outs[0] if len(outs) == 1 else torch.cat(outs)), topk_all
 
 
 def dense_ffn(x, w, pre):
@@ -463,10 +505,25 @@ def moe(x, w, ck, layer):
 
 
 # ---------------------------------------------------------------------------------------------------------- driver
-def run(ck, ids, n_layers, sel_every=16, sel_tail=32):
+LONG_SEL = 16384     # prompts above this length save fewer positions
+LONG_FROM = 114688   # HCA rows past this read ≥ 5 key chunks of 256 (128 window + p / 128 compressed keys > 1024): the
+                     # engine's base takes its long-context prefill kernels (P150 / P172) there
+
+
+def sel_positions(T):
+    """The positions whose states a dump saves (and the gate compares): every 16th and the last 32; a long prompt
+    (T > 16384) every 4096th, every 64th from 114,688 (or from T / 2 when shorter) and the last 32 — at most ~130 a
+    chunk of 8192 rows, so its logits fit one step's logit rows."""
+    if T <= LONG_SEL:
+        return sorted(set(range(0, T, 16)) | set(range(max(0, T - 32), T)))
+    lo = LONG_FROM if T > LONG_FROM + 4096 else T // 2
+    return sorted(set(range(0, T, 4096)) | set(range(lo, T, 64)) | set(range(T - 32, T)))
+
+
+def run(ck, ids, n_layers, qchunk=256, rows=0, kslice=False):
     T = len(ids)
     pos = torch.arange(T, device=DEV)
-    sel = sorted(set(range(0, T, sel_every)) | set(range(max(0, T - sel_tail), T)))
+    sel = sel_positions(T)
     psel = torch.tensor(sel, device=DEV)
     cs_hca = cos_sin(inv_freq_yarn(), pos)
     cs8 = cos_sin_dsa(pos)
@@ -482,10 +539,10 @@ def run(ck, ids, n_layers, sel_every=16, sel_tail=32):
         w = W(ck, f"model.layers.{L}.")
         post, comb, inp = mhc_pre(R, w, "attn", w("input_layernorm.weight"), xr)
         if L in DSA_LAYERS:
-            a, tk = dsa(inp, w, pos, cs8, csn)
+            a, tk = dsa(inp, w, pos, cs8, csn, qchunk, rows, kslice)
             out["dsa"].append(tk[psel])
         else:
-            a, _ = hca(inp, w, pos, cs_hca)
+            a, _ = hca(inp, w, pos, cs_hca, qchunk, rows, kslice)
         R, xr = mhc_post(a, R, post, comb)
         post, comb, inp = mhc_pre(R, w, "ffn", w("post_attention_layernorm.weight"), xr)
         if L == 0:
@@ -557,6 +614,10 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--names", default="")
     ap.add_argument("--layers", type=int, default=43)
+    ap.add_argument("--qchunk", type=int, default=256, help="query rows per attention chunk (memory: 64 for ~139K)")
+    ap.add_argument("--rows", type=int, default=0, help="attention query side in blocks of rows (0: all; 16384 for ~139K)")
+    ap.add_argument("--key-slice", action="store_true", help="attention chunks score only the keys their masks can open")
+    ap.add_argument("--suffix", default=".safetensors", help="dump name <name><suffix> (e.g. .slice.safetensors)")
     a = ap.parse_args()
     ck = Ckpt(a.model)
     prompts = json.load(open(a.prompts))
@@ -567,8 +628,8 @@ def main():
         t0 = time.time()
         print(f"[ref] {name}: {len(ids)} tokens", flush=True)
         with torch.no_grad():
-            res = run(ck, ids, a.layers)
-        save_file({k: v.contiguous() for k, v in res.items()}, os.path.join(a.out, f"{name}.safetensors"))
+            res = run(ck, ids, a.layers, a.qchunk, a.rows, a.key_slice)
+        save_file({k: v.contiguous() for k, v in res.items()}, os.path.join(a.out, name + a.suffix))
         print(f"[ref] {name} done · {time.time() - t0:.0f}s", flush=True)
 
 
