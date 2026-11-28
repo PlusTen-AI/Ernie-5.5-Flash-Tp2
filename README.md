@@ -20,19 +20,22 @@ MXFP4 kernels, DSpark speculative decoding, two-rail RDMA between the Sparks. No
 > stop and ask you. Agents: start there.
 
 ```
-┌───────────────────────────────────────────────────────────────────┬──────────────────────┐
-│ ERNIE 5.5 Flash on 2x DGX Spark · 131K-token agent context        │           plus 0.6.0 │
-├───────────────────────────────────────────────────────────────────┼──────────────────────┤
-│ one agent writing                                                 │           58.6 tok/s │
-│   code · JSON · counting                                          │   70 · 70 · 97 tok/s │
-│ four agents at once, total                                        │            124 tok/s │
-│   JSON · counting                                                 │      147 · 199 tok/s │
-│ reading a 128K prompt                                             │   3,259 tok/s · 40 s │
-│ an agent's next turn after a tool result                          │ 3.3 s to first token │
-│ rewriting a file with one edit (copy drafts)                      │            307 tok/s │
-│ context a request · in the shared KV pool (12 GiB kept free)      │    1,048,576 · ~2.9M │
-└───────────────────────────────────────────────────────────────────┴──────────────────────┘
-  our bench · effort max (engine high) · default sampling (T 1.0, top_p 0.95) · seed 1
+┌─────────────────────────────────────────────────────────────┬────────────────────────────┐
+│ ERNIE 5.5 Flash on 2x DGX Spark · 131K-token agent context  │                 plus 0.6.0 │
+├─────────────────────────────────────────────────────────────┼────────────────────────────┤
+│ one agent writing                                           │                 58.6 tok/s │
+│   code · JSON · counting                                    │         70 · 70 · 97 tok/s │
+│ four agents at once, total                                  │                  124 tok/s │
+│   JSON · counting                                           │            147 · 199 tok/s │
+│ 1 · 4 · 8 · 16 at once, total (coding) *                    │ 71 · 128 · 183 · 247 tok/s │
+│ reading a 128K prompt                                       │         3,259 tok/s · 40 s │
+│ reading a 990K prompt *                                     │        1,894 tok/s · 523 s │
+│ an agent's next turn after a tool result                    │       3.3 s to first token │
+│ rewriting a file with one edit (copy drafts)                │                  307 tok/s │
+│ context a request · KV pool (12 GiB kept free)              │          1,048,576 · ~2.9M │
+└─────────────────────────────────────────────────────────────┴────────────────────────────┘
+  our bench (2026-11-25, engine 0.5.0) · effort max (engine high) · default sampling (T 1.0, top_p 0.95) · seed 1
+  * updated 2026-11-28, engine 0.6.0 (server/bench_lite.py: the coding item at ≈9.4K context; prefill_marks)
 ```
 
 ```sh
